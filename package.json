@@ -1,0 +1,84 @@
+{
+  "name": "dsh-tauri-acp",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 桌面插件：以 ACP（Agent Client Protocol）方式把外部 Agent 注册为模型提供方。",
+  "license": "MIT",
+  "author": "Fleey",
+  "homepage": "https://github.com/Fleey/deepseek-harness-acp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fleey/deepseek-harness-acp.git"
+  },
+  "bugs": "https://github.com/Fleey/deepseek-harness-acp/issues",
+  "keywords": [
+    "dsh",
+    "plugin",
+    "dsh-plugin",
+    "tauri",
+    "deepseek-harness",
+    "acp",
+    "agent-client-protocol",
+    "models"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": "./dist/client.cjs",
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "LICENSE",
+    "cordis.patch.yml",
+    "dist"
+  ],
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/cosmokit": "1.8.6-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.1",
+    "@deepseek-ai/schemastery": "3.18.5-alpha.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "happy-dom": "^20.14.6",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tsdown": "^0.21.10",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.4",
+    "zod": "^4.6.7"
+  }
+}
