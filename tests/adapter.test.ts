@@ -1,7 +1,7 @@
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AcpAgentProfile, PermissionPolicy } from '../src/shared/types.ts'
 import type { AdapterHost, ApprovalOutcome } from '../src/host/types/index.ts'
-import { mkdtempSync, realpathSync } from 'node:fs'
+import { mkdtempSync, readFileSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
@@ -9,6 +9,7 @@ import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { afterEach, describe, expect, it } from 'vitest'
 import { agentsOf, Config } from '../src/host/config/schema.ts'
 import { AcpAdapter } from '../src/host/service/acp-adapter.ts'
+import { ContextWindows, inferContextWindow } from '../src/host/service/context-windows.ts'
 
 const ROUTE = 'mock-acp'
 const MOCK = join(import.meta.dirname, 'fixtures', 'mock-agent.mjs')
@@ -250,6 +251,27 @@ describe('acp adapter', () => {
     const declared = create(profile({ models: [{ id: 'mock-smart', contextWindow: 64_000 }] }))
     await run(declared, request([user('probe')], { model: 'mock-smart' }))
     expect((await declared.resolveModel(ROUTE, 'mock-smart')).context).toEqual({ contextWindow: 64_000 })
+  })
+
+  it('remembers learned context windows across restarts', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'dsh-acp-cw-')), 'nested', 'context-windows.json')
+    const windows = new ContextWindows(file, silentLogger)
+    const adapter = new AcpAdapter(host(), () => new Map([[ROUTE, profile()]]), windows)
+    adapters.push(adapter)
+    await run(adapter, request([user('probe')], { model: 'mock-smart' }))
+    await windows.flush()
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [ROUTE]: { 'mock-smart': 123_456 } })
+    const restarted = new AcpAdapter(host(), () => new Map([[ROUTE, profile()]]), new ContextWindows(file, silentLogger))
+    adapters.push(restarted)
+    expect((await restarted.resolveModel(ROUTE, 'mock-smart')).context).toEqual({ contextWindow: 123_456 })
+  })
+
+  it('infers a 1M window from a "1m" token before the agent reports one', async () => {
+    const adapter = create(profile({ models: [{ id: 'mock-smart', description: 'Smart (1M context)' }] }))
+    expect((await adapter.resolveModel(ROUTE, 'mock-smart')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel(ROUTE, 'mock-fast[1m]')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel(ROUTE, 'mock-fast')).context).toEqual({ contextWindow: 200_000 })
+    expect(inferContextWindow('gpt-10m', 'Model 1M2')).toBeUndefined()
   })
 
   it('sends image attachments as ACP image blocks when the agent accepts them', async () => {

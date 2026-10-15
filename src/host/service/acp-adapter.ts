@@ -20,6 +20,7 @@ import { PLUGIN_ID } from '../../shared/constants.ts'
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL_ID } from '../config/constants.ts'
 import { AcpAgentProcess, applyConfigOptions } from './acp-agent.ts'
 import { ChunkTranslator, usageDelta } from './chunk-translator.ts'
+import { ContextWindows, inferContextWindow } from './context-windows.ts'
 import { decidePermission } from './permission.ts'
 import { consumedIds, conversationOf, fullPrompt, incrementalPrompt, systemText } from './transcript.ts'
 
@@ -49,10 +50,6 @@ function spawnFacts(profile: AcpAgentProfile): string {
   return JSON.stringify([profile.command, profile.args, profile.env, profile.cwd ?? null, profile.authMethod ?? null])
 }
 
-function contextKey(route: string, model: string): string {
-  return `${route}\u0000${model}`
-}
-
 function failure(code: string, message: string): { code: string, message: string } {
   return { code, message }
 }
@@ -68,13 +65,12 @@ export class AcpAdapter extends LlmAdapter {
   private readonly agents = new Map<string, { process: AcpAgentProcess, facts: string }>()
   private readonly bindings = new Map<string, Binding>()
   private readonly turns = new Map<string, PermissionTurn>()
-  /** Context window sizes agents reported through `usage_update`, keyed by route and model. */
-  private readonly contextSizes = new Map<string, number>()
   private readonly retryPolicy: ResolvedRetryPolicy = resolveRetryPolicy(NO_RETRY, `${PLUGIN_ID}: retryPolicy`)
 
   constructor(
     private readonly host: AdapterHost,
     private readonly profiles: () => ReadonlyMap<string, AcpAgentProfile>,
+    private readonly contextWindows: ContextWindows = new ContextWindows(),
   ) {
     super()
   }
@@ -157,7 +153,8 @@ export class AcpAdapter extends LlmAdapter {
    * Exact-model metadata. Capabilities come from the agent itself, so an agent nobody has
    * started yet is probed once (when `discoverModels` allows it): image input from its
    * `promptCapabilities`, reasoning efforts from its `thought_level` option, and the
-   * context window it last reported through `usage_update`.
+   * context window it last reported through `usage_update` (remembered across restarts),
+   * else one a "1m" token in the model's id, name or description implies.
    */
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const profile = this.profiles().get(provider)
@@ -175,7 +172,13 @@ export class AcpAdapter extends LlmAdapter {
       id: model,
       name: configured?.name ?? advertised?.name ?? model,
       inputModalities: this.modalities(provider),
-      context: { contextWindow: configured?.contextWindow ?? this.contextSizes.get(contextKey(provider, model)) ?? profile?.contextWindow ?? DEFAULT_CONTEXT_WINDOW },
+      context: {
+        contextWindow: configured?.contextWindow
+          ?? this.contextWindows.get(provider, model)
+          ?? inferContextWindow(model, configured?.name, configured?.description, advertised?.name, advertised?.description)
+          ?? profile?.contextWindow
+          ?? DEFAULT_CONTEXT_WINDOW,
+      },
       ...efforts === undefined
         ? {}
         : {
@@ -310,11 +313,11 @@ export class AcpAdapter extends LlmAdapter {
     this.turns.set(session.sessionId, { dshSessionId, signal })
     signal?.addEventListener('abort', onAbort, { once: true })
     armIdle()
-    const sizeKey = contextKey(route, binding.model)
+    const model = binding.model
     agent.prompt(session, prompt, (update) => {
       armIdle()
       if (update.sessionUpdate === 'usage_update' && update.size > 0)
-        this.contextSizes.set(sizeKey, update.size)
+        this.contextWindows.set(route, model, update.size)
       else if (update.sessionUpdate === 'config_option_update')
         applyConfigOptions(session, update.configOptions)
       queue.push(...translator.push(update))

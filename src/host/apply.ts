@@ -3,9 +3,13 @@ import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigu
 import type z from '@deepseek-ai/schemastery'
 import type { AcpAgentProfile } from '../shared/types.ts'
 import type { AdapterHost, ApprovalOutcome, ApprovalRequest, HostAgent, HostImage } from './types/index.ts'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
+import process from 'node:process'
 import { PLUGIN_ID, SETTINGS_NS } from '../shared/constants.ts'
 import { agentsOf, Config } from './config/schema.ts'
 import { AcpAdapter } from './service/acp-adapter.ts'
+import { ContextWindows } from './service/context-windows.ts'
 
 /**
  * 0.1 cores offer `installSection` (namespace `llm-acp`, live source swaps); 0.2 cores
@@ -31,6 +35,15 @@ interface ApprovalService {
 
 interface AttachmentsService {
   readImageRequest: (ref: unknown, policy: { maxPixels: number, maxBytes: number }, signal?: AbortSignal) => Promise<HostImage>
+}
+
+/** Where learned context windows persist: `$DSH_HOME` (default `~/.dsh`), as dsh resolves it. */
+function contextWindowsFile(): string {
+  const configured = process.env.DSH_HOME?.trim()
+  const home = configured === undefined || configured.length === 0
+    ? join(homedir(), '.dsh')
+    : configured === '~' || configured.startsWith('~/') ? join(homedir(), configured.slice(1)) : configured
+  return join(resolve(home), 'cache', PLUGIN_ID, 'context-windows.json')
 }
 
 /** Same request-image budget dsh-llm-pi-ai uses by default. */
@@ -103,7 +116,7 @@ export function apply(ctx: Context, config: Config): void {
         : (ref: unknown, signal?: AbortSignal) => attachments.readImageRequest(ref, IMAGE_POLICY, signal)
     },
   }
-  const adapter = new AcpAdapter(host, profiles)
+  const adapter = new AcpAdapter(host, profiles, new ContextWindows(contextWindowsFile(), ctx.logger))
   ctx.effect(() => () => adapter.dispose(), `${PLUGIN_ID}: agents`)
 
   // Discovery serves the settings editor's "discover models" action. An ACP draft is a
