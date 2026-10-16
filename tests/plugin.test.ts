@@ -76,6 +76,37 @@ describe('plugin wiring', () => {
     await section.dispose()
   })
 
+  it('sizes request images the way the attachment service expects', async () => {
+    const ctx = new Context()
+    ctx.plugin(LlmRuntime)
+    const targets: unknown[] = []
+    // The service resizes to an exact target; handing it a policy made every read throw and
+    // the image reached the agent as text instead.
+    ctx.provide('attachments', {
+      readImageRequest: (_ref: unknown, target: unknown) => {
+        targets.push(target)
+        return Promise.resolve({ data: new Uint8Array([104, 105]), mediaType: 'image/png', width: 2508, height: 1672 })
+      },
+    })
+    const fiber = ctx.plugin(plugin, { agents: { 'claude-acp': { command: process.execPath, args: [MOCK] } } } as any)
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    const attachment = { attachmentId: 'sha256:abc', mediaType: 'image/png', width: 3000, height: 2000, bytes: 9 }
+    expect((await ctx.llm.resolveModelInfo('claude-acp', 'mock-fast')).inputModalities).toEqual(['text', 'image'])
+    const chunks: StreamChunk[] = []
+    for await (const chunk of ctx.llm.stream({
+      provider: 'claude-acp',
+      model: 'mock-fast',
+      messages: [{ id: 'u1', role: 'user', content: [{ type: 'text', text: 'probe pic' }, { type: 'image', attachment }], source: { kind: 'user' } } as any],
+    }))
+      chunks.push(chunk)
+
+    expect(targets).toEqual([{ width: 2508, height: 1672, maxBytes: 1_048_576 }])
+    const text = chunks.flatMap(chunk => chunk.type === 'text-delta' ? [chunk.text] : []).join('')
+    expect(text).toContain('images:image/png:aGk=')
+    await fiber.dispose()
+  })
+
   it('serves agents as a volatile form field and applies in-place edits', async () => {
     expect((plugin.Config as any).dict.agents.meta.volatile).toBe(true)
     const ctx = new Context()
