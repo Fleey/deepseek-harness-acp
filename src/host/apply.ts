@@ -3,6 +3,7 @@ import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigu
 import type z from '@deepseek-ai/schemastery'
 import type { AcpAgentProfile } from '../shared/types.ts'
 import type { AdapterHost, ApprovalOutcome, ApprovalRequest, HostAgent, HostImage } from './types/index.ts'
+import type { RequestImageBudget, RequestImageTarget } from './service/request-image.ts'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import process from 'node:process'
@@ -11,6 +12,7 @@ import { agentsOf, Config } from './config/schema.ts'
 import { AcpAdapter } from './service/acp-adapter.ts'
 import { ContextWindows } from './service/context-windows.ts'
 import { PromptCapabilitiesCache } from './service/prompt-capabilities.ts'
+import { requestImageTarget } from './service/request-image.ts'
 
 /**
  * 0.1 cores offer `installSection` (namespace `llm-acp`, live source swaps); 0.2 cores
@@ -35,7 +37,8 @@ interface ApprovalService {
 }
 
 interface AttachmentsService {
-  readImageRequest: (ref: unknown, policy: { maxPixels: number, maxBytes: number }, signal?: AbortSignal) => Promise<HostImage>
+  /** `target` is the exact size to produce, not a budget: see {@link requestImageTarget}. */
+  readImageRequest: (ref: unknown, target: RequestImageTarget, signal?: AbortSignal) => Promise<HostImage>
 }
 
 /** Where this plugin's learned facts persist: `$DSH_HOME` (default `~/.dsh`), as dsh resolves it. */
@@ -48,7 +51,7 @@ function cacheFile(name: string): string {
 }
 
 /** Same request-image budget dsh-llm-pi-ai uses by default. */
-const IMAGE_POLICY = { maxPixels: 4_194_304, maxBytes: 1_048_576 }
+const IMAGE_BUDGET: RequestImageBudget = { maxPixels: 4_194_304, maxBytes: 1_048_576 }
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -114,7 +117,7 @@ export function apply(ctx: Context, config: Config): void {
       const attachments = ctx.get('attachments') as AttachmentsService | undefined
       return typeof attachments?.readImageRequest !== 'function'
         ? undefined
-        : (ref: unknown, signal?: AbortSignal) => attachments.readImageRequest(ref, IMAGE_POLICY, signal)
+        : (ref: unknown, signal?: AbortSignal) => attachments.readImageRequest(ref, requestImageTarget(ref, IMAGE_BUDGET), signal)
     },
   }
   const adapter = new AcpAdapter(

@@ -11313,6 +11313,56 @@ var AcpAdapter = class extends LlmAdapter {
 	}
 };
 //#endregion
+//#region src/host/service/request-image.ts
+/**
+* Aspect-preserving integer dimensions inside a total-pixel budget: rounded inward, never
+* enlarging. Same geometry `@deepseek-ai/dsh-attachment` applies, reproduced here because the
+* host supplies that package at runtime and this plugin bundles none of it.
+*/
+function requestImageDimensions(width, height, maxPixels) {
+	const scale = Math.min(1, Math.sqrt(maxPixels / (width * height)));
+	if (scale === 1) return {
+		width,
+		height
+	};
+	if (width >= height) {
+		let projectedWidth = Math.max(1, Math.floor(width * scale));
+		let projectedHeight = Math.max(1, Math.round(projectedWidth * height / width));
+		while (projectedWidth * projectedHeight > maxPixels && projectedWidth > 1) {
+			projectedWidth -= 1;
+			projectedHeight = Math.max(1, Math.round(projectedWidth * height / width));
+		}
+		return {
+			width: projectedWidth,
+			height: projectedHeight
+		};
+	}
+	let projectedHeight = Math.max(1, Math.floor(height * scale));
+	let projectedWidth = Math.max(1, Math.round(projectedHeight * width / height));
+	while (projectedWidth * projectedHeight > maxPixels && projectedHeight > 1) {
+		projectedHeight -= 1;
+		projectedWidth = Math.max(1, Math.round(projectedHeight * width / height));
+	}
+	return {
+		width: projectedWidth,
+		height: projectedHeight
+	};
+}
+function sideOf(ref, side) {
+	const value = ref[side];
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) throw new Error(`${PLUGIN_ID}: image attachment has no usable ${side}; cannot size its request version`);
+	return value;
+}
+/** The request target for one durable image reference, which carries the source dimensions. */
+function requestImageTarget(ref, budget) {
+	if (typeof ref !== "object" || ref === null) throw new Error(`${PLUGIN_ID}: image attachment reference is not an object`);
+	const source = ref;
+	return {
+		...requestImageDimensions(sideOf(source, "width"), sideOf(source, "height"), budget.maxPixels),
+		maxBytes: budget.maxBytes
+	};
+}
+//#endregion
 //#region src/host/apply.ts
 /** Where this plugin's learned facts persist: `$DSH_HOME` (default `~/.dsh`), as dsh resolves it. */
 function cacheFile(name) {
@@ -11320,7 +11370,7 @@ function cacheFile(name) {
 	return join(resolve(configured === void 0 || configured.length === 0 ? join(homedir(), ".dsh") : configured === "~" || configured.startsWith("~/") ? join(homedir(), configured.slice(1)) : configured), "cache", PLUGIN_ID, name);
 }
 /** Same request-image budget dsh-llm-pi-ai uses by default. */
-const IMAGE_POLICY = {
+const IMAGE_BUDGET = {
 	maxPixels: 4194304,
 	maxBytes: 1048576
 };
@@ -11370,7 +11420,7 @@ function apply(ctx, config) {
 		},
 		get readImage() {
 			const attachments = ctx.get("attachments");
-			return typeof attachments?.readImageRequest !== "function" ? void 0 : (ref, signal) => attachments.readImageRequest(ref, IMAGE_POLICY, signal);
+			return typeof attachments?.readImageRequest !== "function" ? void 0 : (ref, signal) => attachments.readImageRequest(ref, requestImageTarget(ref, IMAGE_BUDGET), signal);
 		}
 	}, profiles, new ContextWindows(cacheFile("context-windows.json"), ctx.logger), new PromptCapabilitiesCache(cacheFile("prompt-capabilities.json"), ctx.logger));
 	ctx.effect(() => () => adapter.dispose(), `${PLUGIN_ID}: agents`);
