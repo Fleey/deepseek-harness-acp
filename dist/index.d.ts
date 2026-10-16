@@ -7,6 +7,11 @@ import { Volatile } from "@deepseek-ai/cosmokit";
 /** Profile shapes shared by the host schema and the client settings editor. */
 type PermissionPolicy = 'ask' | 'allow' | 'read-only' | 'reject';
 type SystemPromptMode = 'drop' | 'forward';
+/**
+ * Whether the route offers image input. `auto` follows the `promptCapabilities` the agent
+ * declares in its ACP handshake; the other two override an agent that misreports them.
+ */
+type ImageInputMode = 'auto' | 'force' | 'off';
 interface AcpModelProfile {
   id: string;
   name?: string;
@@ -23,6 +28,7 @@ interface AcpAgentProfile {
   models: AcpModelProfile[];
   discoverModels: boolean;
   permission: PermissionPolicy;
+  imageInput: ImageInputMode;
   systemPrompt: SystemPromptMode;
   showToolCalls: boolean;
   contextWindow: number;
@@ -88,6 +94,38 @@ interface AdapterHost {
   readImage: ((ref: unknown, signal?: AbortSignal) => Promise<HostImage>) | undefined;
 }
 //#endregion
+//#region src/host/service/prompt-capabilities.d.ts
+/**
+ * The prompt content one ACP agent accepts, exactly as its `initialize` answer declares it.
+ * ACP has no other place to ask: an agent states its accepted content types once, during
+ * the handshake, so the answer is learned by starting the agent and kept afterwards.
+ */
+interface AcpPromptCapabilities {
+  image: boolean;
+  audio: boolean;
+  embeddedContext: boolean;
+}
+/**
+ * Prompt capabilities agents answered with during `initialize`, keyed by route. dsh asks a
+ * route what input it accepts before the user can attach anything, which is earlier than the
+ * first turn that would start the agent; with a `file` the last answer survives restarts, so
+ * a route reports image input straight away instead of claiming text only until it is used.
+ *
+ * Each entry remembers the spawn facts it came from: a route pointed at a different command
+ * answers for a different agent, so its stored answer is ignored until the new one speaks.
+ */
+declare class PromptCapabilitiesCache {
+  private readonly file?;
+  private readonly logger?;
+  private readonly entries;
+  private saving;
+  constructor(file?: string | undefined, logger?: HostLogger | undefined);
+  get(route: string, facts: string): AcpPromptCapabilities | undefined;
+  set(route: string, facts: string, capabilities: AcpPromptCapabilities): void;
+  /** Settles once every answer stored so far is on disk. */
+  flush(): Promise<void>;
+}
+//#endregion
 //#region src/host/service/acp-agent.d.ts
 interface AcpAdvertisedModel {
   id: string;
@@ -119,11 +157,12 @@ declare class AcpAdapter extends LlmAdapter {
   private readonly host;
   private readonly profiles;
   private readonly contextWindows;
+  private readonly capabilities;
   private readonly agents;
   private readonly bindings;
   private readonly turns;
   private readonly retryPolicy;
-  constructor(host: AdapterHost, profiles: () => ReadonlyMap<string, AcpAgentProfile>, contextWindows?: ContextWindows);
+  constructor(host: AdapterHost, profiles: () => ReadonlyMap<string, AcpAgentProfile>, contextWindows?: ContextWindows, capabilities?: PromptCapabilitiesCache);
   sync(): void;
   dispose(): void;
   providerInfo(provider: string): LlmProviderInfo;
@@ -136,15 +175,28 @@ declare class AcpAdapter extends LlmAdapter {
    */
   advertisedModels(provider: string, signal?: AbortSignal): Promise<readonly AcpAdvertisedModel[]>;
   /**
-   * Exact-model metadata. Capabilities come from the agent itself, so an agent nobody has
-   * started yet is probed once (when `discoverModels` allows it): image input from its
-   * `promptCapabilities`, reasoning efforts from its `thought_level` option, and the
-   * context window it last reported through `usage_update` (remembered across restarts),
-   * else one a "1m" token in the model's id, name or description implies.
+   * Exact-model metadata. Capabilities come from the agent itself: accepted input from the
+   * `promptCapabilities` of its ACP handshake (learned here, remembered across restarts),
+   * reasoning efforts from its `thought_level` option, and the context window it last
+   * reported through `usage_update`, else one a "1m" token in the model's id, name or
+   * description implies.
    */
   resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
-  /** Image input is offered only when the agent accepts images and dsh can read attachments. */
+  /**
+   * What the route accepts as input. dsh reads an omitted `inputModalities` as "unknown" and
+   * sends images through untouched, while an explicit list without `image` is a negative it
+   * acts on by replacing every attachment with text before the adapter is even called. So an
+   * agent whose handshake nobody has heard yet must stay silent rather than claim text only.
+   */
   private modalities;
+  /** The running agent's handshake answer, else the one it gave for these spawn facts before. */
+  private promptCapabilitiesOf;
+  /**
+   * Make sure the ACP handshake has happened at least once, since that is where an agent
+   * states the content types it accepts. The answer is cached per route, so this starts an
+   * agent only the first time dsh asks about a route it has never heard from.
+   */
+  private learnCapabilities;
   /** Read every image the prompt wants, as base64 request versions; unreadable ones stay text. */
   private readImages;
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>;

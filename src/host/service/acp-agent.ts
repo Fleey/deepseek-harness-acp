@@ -12,6 +12,7 @@ import type {
 import type { ChildProcess } from 'node:child_process'
 import type { AcpAgentProfile } from '../../shared/types.ts'
 import type { HostLogger } from '../types/index.ts'
+import type { AcpPromptCapabilities } from './prompt-capabilities.ts'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import process from 'node:process'
@@ -20,6 +21,7 @@ import { client as createClientApp, methods, ndJsonStream, PROTOCOL_VERSION } fr
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { PLUGIN_ID } from '../../shared/constants.ts'
 import { DEFAULT_MODEL_ID } from '../config/constants.ts'
+import { promptCapabilitiesOf } from './prompt-capabilities.ts'
 
 export interface AcpAdvertisedModel {
   id: string
@@ -57,6 +59,8 @@ export interface AcpAgentOptions {
   profile: () => AcpAgentProfile
   onPermission: AcpPermissionHandler
   logger: HostLogger
+  /** Every completed handshake, so the caller can remember what this agent accepts. */
+  onCapabilities?: (capabilities: AcpPromptCapabilities) => void
 }
 
 interface LiveAgent {
@@ -154,8 +158,23 @@ export class AcpAgentProcess {
     return this.live?.generation ?? -1
   }
 
+  /** What the running agent said it accepts in a prompt; undefined until it has spoken. */
+  get promptCapabilities(): AcpPromptCapabilities | undefined {
+    const live = this.live
+    return live === undefined ? undefined : promptCapabilitiesOf(live.init.agentCapabilities?.promptCapabilities)
+  }
+
   get supportsImages(): boolean {
-    return this.live?.init.agentCapabilities?.promptCapabilities?.image === true
+    return this.promptCapabilities?.image === true
+  }
+
+  /**
+   * Ask the agent itself what prompt content it accepts. ACP answers that in `initialize`,
+   * so the handshake alone is enough — no session and no turn.
+   */
+  async probeCapabilities(signal?: AbortSignal): Promise<AcpPromptCapabilities> {
+    const live = await this.ensure(signal)
+    return promptCapabilitiesOf(live.init.agentCapabilities?.promptCapabilities)
   }
 
   get advertisedModels(): readonly AcpAdvertisedModel[] | undefined {
@@ -433,6 +452,7 @@ export class AcpAgentProcess {
       }
     })
     this.live = live
+    this.options.onCapabilities?.(promptCapabilitiesOf(init.agentCapabilities?.promptCapabilities))
     return live
   }
 

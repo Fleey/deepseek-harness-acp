@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { agentsOf, Config } from '../src/host/config/schema.ts'
 import { AcpAdapter } from '../src/host/service/acp-adapter.ts'
 import { ContextWindows, inferContextWindow } from '../src/host/service/context-windows.ts'
+import { PromptCapabilitiesCache } from '../src/host/service/prompt-capabilities.ts'
 
 const ROUTE = 'mock-acp'
 const MOCK = join(import.meta.dirname, 'fixtures', 'mock-agent.mjs')
@@ -57,10 +58,16 @@ async function run(adapter: AcpAdapter, options: GenerateOptions) {
 }
 
 const adapters: AcpAdapter[] = []
-function create(p: AcpAgentProfile = profile(), h: AdapterHost = host()): AcpAdapter {
-  const adapter = new AcpAdapter(h, () => new Map([[ROUTE, p]]))
+function create(p: AcpAgentProfile = profile(), h: AdapterHost = host(), capabilities?: PromptCapabilitiesCache): AcpAdapter {
+  const adapter = new AcpAdapter(h, () => new Map([[ROUTE, p]]), new ContextWindows(), capabilities)
   adapters.push(adapter)
   return adapter
+}
+
+const readsImages: AdapterHost['readImage'] = async () => ({ data: new Uint8Array([104, 105]), mediaType: 'image/png', width: 8, height: 8 })
+
+function imageHost(): AdapterHost {
+  return host(undefined, true, readsImages)
 }
 
 afterEach(() => {
@@ -288,6 +295,59 @@ describe('acp adapter', () => {
 
     const textOnly = await run(create(), request([{ ...message, id: `m${++counter}` }]))
     expect(textOnly.text).toMatch(/^effort:medium\|images:\|probe pic\|\[image omitted because this model accepts text only/)
+  })
+
+  it('asks the agent over ACP which content it accepts', async () => {
+    const declared = profile({ models: [{ id: 'mock-smart' }], discoverModels: false })
+    // Nothing has spoken to the agent yet: unknown is not the same as text-only, so dsh is
+    // told nothing rather than being told images are unsupported.
+    const adapter = create(declared, imageHost())
+    expect((await adapter.listModels(ROUTE))[0]!.inputModalities).toBeUndefined()
+    // Resolving one exact model performs the ACP handshake and reads its promptCapabilities.
+    expect((await adapter.resolveModel(ROUTE, 'mock-smart')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.listModels(ROUTE))[0]!.inputModalities).toEqual(['text', 'image'])
+
+    const noImages = create(profile({ env: { MOCK_NO_IMAGES: '1' }, models: [{ id: 'mock-smart' }], discoverModels: false }), imageHost())
+    expect((await noImages.resolveModel(ROUTE, 'mock-smart')).inputModalities).toEqual(['text'])
+  })
+
+  it('remembers the handshake answer across restarts, per spawn command', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'dsh-acp-pc-')), 'nested', 'prompt-capabilities.json')
+    const learning = new PromptCapabilitiesCache(file, silentLogger)
+    await create(profile(), imageHost(), learning).resolveModel(ROUTE, 'mock-smart')
+    await learning.flush()
+    expect(JSON.parse(readFileSync(file, 'utf8'))[ROUTE]).toMatchObject({ image: true, audio: false, embeddedContext: false })
+
+    // A restart reports image input before anything starts the agent again.
+    const restarted = create(profile({ models: [{ id: 'mock-smart' }], discoverModels: false }), imageHost(), new PromptCapabilitiesCache(file, silentLogger))
+    expect((await restarted.listModels(ROUTE))[0]!.inputModalities).toEqual(['text', 'image'])
+
+    // Pointing the route at another command makes the stored answer another agent's.
+    const repointed = create(profile({ env: { CHANGED: '1' }, models: [{ id: 'mock-smart' }], discoverModels: false }), imageHost(), new PromptCapabilitiesCache(file, silentLogger))
+    expect((await repointed.listModels(ROUTE))[0]!.inputModalities).toBeUndefined()
+  })
+
+  it('lets imageInput override what the agent declares', async () => {
+    const forced = create(profile({ imageInput: 'force', models: [{ id: 'mock-smart' }], discoverModels: false }), imageHost())
+    expect((await forced.resolveModel(ROUTE, 'mock-smart')).inputModalities).toEqual(['text', 'image'])
+    const off = create(profile({ imageInput: 'off', models: [{ id: 'mock-smart' }], discoverModels: false }), imageHost())
+    expect((await off.resolveModel(ROUTE, 'mock-smart')).inputModalities).toEqual(['text'])
+    // Forcing it on cannot conjure bytes dsh has no attachment store to read.
+    const unreadable = create(profile({ imageInput: 'force', models: [{ id: 'mock-smart' }], discoverModels: false }))
+    expect((await unreadable.resolveModel(ROUTE, 'mock-smart')).inputModalities).toEqual(['text'])
+  })
+
+  it('replays images from the history when it rebuilds a session', async () => {
+    const attachment = { attachmentId: 'sha256:fedcba9876543210', mediaType: 'image/png', width: 8, height: 8, bytes: 4 }
+    const pictured = { id: `m${++counter}`, role: 'user', content: [{ type: 'text', text: 'look at this' }, { type: 'image', attachment }], source: { kind: 'user' } }
+    const adapter = create(profile(), imageHost())
+    await run(adapter, request([user('hello')]))
+    // Divergent history forces a fresh session built from the whole transcript.
+    const result = await run(adapter, request([pictured, assistant('from deepseek', 'deepseek-official'), user('probe now')]))
+    expect(result.text).toContain('images:image/png:aGk=')
+    expect(result.text).toContain('<conversation_history>')
+    expect(result.text).toContain('User: look at this')
+    expect(result.text.endsWith('|probe now')).toBe(true)
   })
 })
 

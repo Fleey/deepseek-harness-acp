@@ -1,5 +1,5 @@
 import type { ReactElement, ReactNode } from 'react'
-import type { PermissionPolicy } from '../../shared/types.ts'
+import type { ImageInputMode, PermissionPolicy } from '../../shared/types.ts'
 import type { Translate } from '../locales/index.ts'
 import type { AgentDraft } from '../service/agents.types.ts'
 import type { Message } from './agents-section.tsx'
@@ -30,6 +30,16 @@ const PERMISSIONS: readonly { value: PermissionPolicy, key: 'permissionAsk' | 'p
 
 function isPermission(value: string): value is PermissionPolicy {
   return PERMISSIONS.some(option => option.value === value)
+}
+
+const IMAGE_INPUTS: readonly { value: ImageInputMode, key: 'imageInputAuto' | 'imageInputForce' | 'imageInputOff' }[] = [
+  { value: 'auto', key: 'imageInputAuto' },
+  { value: 'force', key: 'imageInputForce' },
+  { value: 'off', key: 'imageInputOff' },
+]
+
+function isImageInput(value: string): value is ImageInputMode {
+  return IMAGE_INPUTS.some(option => option.value === value)
 }
 
 function Field({ label, hint, children }: { label: string, hint?: string, children: ReactNode }): ReactElement {
@@ -121,6 +131,19 @@ export function AgentEditorForm(props: AgentEditorFormProps): ReactElement {
           }}
         >
           {PERMISSIONS.map(option => <option key={option.value} value={option.value}>{t(option.key)}</option>)}
+        </select>
+      </Field>
+      <Field label={t('imageInput')} hint={t('imageInputHint')}>
+        <select
+          className="dta-input"
+          value={draft.imageInput}
+          disabled={disabled}
+          onChange={(event) => {
+            if (isImageInput(event.target.value))
+              onChange({ imageInput: event.target.value })
+          }}
+        >
+          {IMAGE_INPUTS.map(option => <option key={option.value} value={option.value}>{t(option.key)}</option>)}
         </select>
       </Field>
       <div className="dta-field">
