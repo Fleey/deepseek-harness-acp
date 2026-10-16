@@ -34,6 +34,7 @@ const AcpAgentProfile: z<AcpAgentProfile> = z.object({
   models: z.array(AcpModelProfile).default([]),
   discoverModels: z.boolean().default(true),
   permission: z.union(['ask', 'allow', 'read-only', 'reject'] as const).default('ask'),
+  imageInput: z.union(['auto', 'force', 'off'] as const).default('auto'),
   systemPrompt: z.union(['drop', 'forward'] as const).default('drop'),
   showToolCalls: z.boolean().default(true),
   contextWindow: z.natural().default(DEFAULT_CONTEXT_WINDOW),

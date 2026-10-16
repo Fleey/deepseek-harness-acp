@@ -1,4 +1,4 @@
-import type { AcpAgentProfile, AcpModelProfile, PermissionPolicy } from '../../shared/types.ts'
+import type { AcpAgentProfile, AcpModelProfile, ImageInputMode, PermissionPolicy } from '../../shared/types.ts'
 import type { ConfigForm, JsonValue, LlmDiscoveredModel, LlmRemote } from '../types/runtime.ts'
 
 /** One configured ACP agent as the settings page lists it. */
@@ -29,6 +29,7 @@ export interface AgentDraft {
   env: string
   authMethod: string
   permission: PermissionPolicy
+  imageInput: ImageInputMode
   models: AcpModelProfile[]
 }
 

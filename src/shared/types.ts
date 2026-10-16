@@ -4,6 +4,12 @@ export type PermissionPolicy = 'ask' | 'allow' | 'read-only' | 'reject'
 
 export type SystemPromptMode = 'drop' | 'forward'
 
+/**
+ * Whether the route offers image input. `auto` follows the `promptCapabilities` the agent
+ * declares in its ACP handshake; the other two override an agent that misreports them.
+ */
+export type ImageInputMode = 'auto' | 'force' | 'off'
+
 export interface AcpModelProfile {
   id: string
   name?: string
@@ -21,6 +27,7 @@ export interface AcpAgentProfile {
   models: AcpModelProfile[]
   discoverModels: boolean
   permission: PermissionPolicy
+  imageInput: ImageInputMode
   systemPrompt: SystemPromptMode
   showToolCalls: boolean
   contextWindow: number

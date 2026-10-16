@@ -4,7 +4,7 @@ import type { AgentDraft, AgentRow, AgentsSnapshot, DraftValidation } from './ag
 import { ROUTE_PATTERN } from '../constants/index.ts'
 
 /** Profile keys the editor owns; everything else in a stored profile is carried over untouched. */
-const EDITED_KEYS = ['displayName', 'command', 'args', 'env', 'authMethod', 'permission', 'models'] as const
+const EDITED_KEYS = ['displayName', 'command', 'args', 'env', 'authMethod', 'permission', 'imageInput', 'models'] as const
 
 type JsonObject = Record<string, JsonValue>
 
@@ -44,6 +44,7 @@ function modelsOf(value: JsonValue | undefined): AcpModelProfile[] {
 /** Read one resolved profile defensively; the Host already applied schema defaults. */
 function profileOf(raw: JsonObject): AcpAgentProfile {
   const permission = raw.permission
+  const imageInput = raw.imageInput
   return {
     ...typeof raw.displayName === 'string' ? { displayName: raw.displayName } : {},
     command: typeof raw.command === 'string' ? raw.command : '',
@@ -54,6 +55,7 @@ function profileOf(raw: JsonObject): AcpAgentProfile {
     models: modelsOf(raw.models),
     discoverModels: raw.discoverModels !== false,
     permission: permission === 'allow' || permission === 'read-only' || permission === 'reject' ? permission : 'ask',
+    imageInput: imageInput === 'force' || imageInput === 'off' ? imageInput : 'auto',
     systemPrompt: raw.systemPrompt === 'forward' ? 'forward' : 'drop',
     showToolCalls: raw.showToolCalls !== false,
     contextWindow: typeof raw.contextWindow === 'number' ? raw.contextWindow : 0,
@@ -106,7 +108,7 @@ export function parseEnv(text: string): { ok: true, env: Record<string, string> 
 }
 
 export function emptyDraft(): AgentDraft {
-  return { originalRoute: null, route: '', displayName: '', command: '', args: '', env: '', authMethod: '', permission: 'ask', models: [] }
+  return { originalRoute: null, route: '', displayName: '', command: '', args: '', env: '', authMethod: '', permission: 'ask', imageInput: 'auto', models: [] }
 }
 
 export function draftOf(row: AgentRow): AgentDraft {
@@ -120,6 +122,7 @@ export function draftOf(row: AgentRow): AgentDraft {
     env: formatEnv(profile.env),
     authMethod: profile.authMethod ?? '',
     permission: profile.permission,
+    imageInput: profile.imageInput,
     models: profile.models.map(model => ({ ...model })),
   }
 }
@@ -175,6 +178,7 @@ export function validateDraft(draft: AgentDraft, rows: readonly AgentRow[]): Dra
     ...Object.keys(env.env).length > 0 ? { env: env.env } : {},
     ...authMethod.length > 0 ? { authMethod } : {},
     permission: draft.permission,
+    ...draft.imageInput === 'auto' ? {} : { imageInput: draft.imageInput },
     ...draft.models.length > 0 ? { models: draft.models.map(modelJson) } : {},
   }
   return { ok: true, route, profile }

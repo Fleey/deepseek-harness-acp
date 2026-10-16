@@ -5,6 +5,7 @@ import z from "@deepseek-ai/schemastery";
 import { LlmAdapter, LlmError, fileHandleText, offloadedImageText, requestImageHandleText, resolveRetryPolicy, textOnlyImageText } from "@deepseek-ai/dsh-llm";
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 //#region src/shared/constants.ts
@@ -40,6 +41,11 @@ const AcpAgentProfile = z.object({
 		"read-only",
 		"reject"
 	]).default("ask"),
+	imageInput: z.union([
+		"auto",
+		"force",
+		"off"
+	]).default("auto"),
 	systemPrompt: z.union(["drop", "forward"]).default("drop"),
 	showToolCalls: z.boolean().default(true),
 	contextWindow: z.natural().default(DEFAULT_CONTEXT_WINDOW),
@@ -10031,6 +10037,90 @@ new Set([
 ]);
 new Set([CLIENT_METHODS.session_update, CLIENT_METHODS.elicitation_complete]);
 //#endregion
+//#region src/host/service/prompt-capabilities.ts
+/** Read an `initialize` answer's prompt capabilities; every absent flag is a negative. */
+function promptCapabilitiesOf(capabilities) {
+	return {
+		image: capabilities?.image === true,
+		audio: capabilities?.audio === true,
+		embeddedContext: capabilities?.embeddedContext === true
+	};
+}
+function fingerprint(facts) {
+	return createHash("sha256").update(facts).digest("hex").slice(0, 16);
+}
+function entryOf(value) {
+	if (typeof value !== "object" || value === null) return void 0;
+	const record = value;
+	return {
+		facts: record.facts,
+		image: record.image === true,
+		audio: record.audio === true,
+		embeddedContext: record.embeddedContext === true
+	};
+}
+/**
+* Prompt capabilities agents answered with during `initialize`, keyed by route. dsh asks a
+* route what input it accepts before the user can attach anything, which is earlier than the
+* first turn that would start the agent; with a `file` the last answer survives restarts, so
+* a route reports image input straight away instead of claiming text only until it is used.
+*
+* Each entry remembers the spawn facts it came from: a route pointed at a different command
+* answers for a different agent, so its stored answer is ignored until the new one speaks.
+*/
+var PromptCapabilitiesCache = class {
+	entries = /* @__PURE__ */ new Map();
+	saving = Promise.resolve();
+	constructor(file, logger) {
+		this.file = file;
+		this.logger = logger;
+		if (file === void 0) return;
+		try {
+			const stored = JSON.parse(readFileSync(file, "utf8"));
+			for (const [route, value] of Object.entries(stored)) {
+				const entry = entryOf(value);
+				if (entry !== void 0 && typeof entry.facts === "string") this.entries.set(route, {
+					...entry,
+					facts: entry.facts
+				});
+			}
+		} catch (error) {
+			if (error.code !== "ENOENT") logger?.warn(`${PLUGIN_ID}: ignoring unreadable prompt capability cache ${file}`, error);
+		}
+	}
+	get(route, facts) {
+		const entry = this.entries.get(route);
+		if (entry === void 0 || entry.facts !== fingerprint(facts)) return void 0;
+		return {
+			image: entry.image,
+			audio: entry.audio,
+			embeddedContext: entry.embeddedContext
+		};
+	}
+	set(route, facts, capabilities) {
+		const entry = {
+			...capabilities,
+			facts: fingerprint(facts)
+		};
+		const known = this.entries.get(route);
+		if (known !== void 0 && known.facts === entry.facts && known.image === entry.image && known.audio === entry.audio && known.embeddedContext === entry.embeddedContext) return;
+		this.entries.set(route, entry);
+		const file = this.file;
+		if (file === void 0) return;
+		const snapshot = Object.fromEntries(this.entries);
+		this.saving = this.saving.then(async () => {
+			mkdirSync(dirname(file), { recursive: true });
+			await writeFile(file, `${JSON.stringify(snapshot, null, 2)}\n`);
+		}).catch((error) => {
+			this.logger?.warn(`${PLUGIN_ID}: could not save prompt capability cache ${file}`, error);
+		});
+	}
+	/** Settles once every answer stored so far is on disk. */
+	flush() {
+		return this.saving;
+	}
+};
+//#endregion
 //#region src/host/service/acp-agent.ts
 const AUTH_REQUIRED_CODE = -32e3;
 const STDERR_TAIL_BYTES = 4096;
@@ -10119,8 +10209,20 @@ var AcpAgentProcess = class {
 	get generation() {
 		return this.live?.generation ?? -1;
 	}
+	/** What the running agent said it accepts in a prompt; undefined until it has spoken. */
+	get promptCapabilities() {
+		const live = this.live;
+		return live === void 0 ? void 0 : promptCapabilitiesOf(live.init.agentCapabilities?.promptCapabilities);
+	}
 	get supportsImages() {
-		return this.live?.init.agentCapabilities?.promptCapabilities?.image === true;
+		return this.promptCapabilities?.image === true;
+	}
+	/**
+	* Ask the agent itself what prompt content it accepts. ACP answers that in `initialize`,
+	* so the handshake alone is enough — no session and no turn.
+	*/
+	async probeCapabilities(signal) {
+		return promptCapabilitiesOf((await this.ensure(signal)).init.agentCapabilities?.promptCapabilities);
 	}
 	get advertisedModels() {
 		return this.advertised;
@@ -10351,6 +10453,7 @@ var AcpAgentProcess = class {
 			}
 		});
 		this.live = live;
+		this.options.onCapabilities?.(promptCapabilitiesOf(init.agentCapabilities?.promptCapabilities));
 		return live;
 	}
 	stderrSuffix() {
@@ -10628,37 +10731,66 @@ function blockText(block) {
 function messageText(message) {
 	return message.content.map(blockText).filter((text) => text !== void 0 && text.length > 0).join("\n");
 }
-function toAcpBlocks(messages, images) {
-	const blocks = [];
-	for (const message of messages) for (const block of message.content) {
-		if (block.type === "image" && images !== void 0 && block.offloaded !== true) {
-			const id = String(block.attachment.attachmentId);
-			const image = images.read.get(id);
-			if (image !== void 0) {
-				blocks.push({
-					type: "text",
-					text: requestImageHandleText(block.attachment, image)
-				});
-				blocks.push({
-					type: "image",
-					data: image.data,
-					mimeType: image.mimeType
-				});
-				continue;
-			}
-			images.wanted.set(id, block.attachment);
-		}
-		const text = blockText(block);
-		if (text !== void 0 && text.length > 0) blocks.push({
+/**
+* One content block as the agent sees it: the image bytes read for this turn plus their
+* handle text, else whatever text stands in for the block. An image nobody has read yet is
+* recorded as wanted, so the caller can read it and build the prompt again.
+*/
+function blockParts(block, images) {
+	if (block.type === "image" && images !== void 0 && block.offloaded !== true) {
+		const id = String(block.attachment.attachmentId);
+		const image = images.read.get(id);
+		if (image !== void 0) return [{
 			type: "text",
-			text
-		});
+			text: requestImageHandleText(block.attachment, image)
+		}, {
+			type: "image",
+			data: image.data,
+			mimeType: image.mimeType
+		}];
+		images.wanted.set(id, block.attachment);
 	}
+	const text = blockText(block);
+	return text === void 0 || text.length === 0 ? [] : [{
+		type: "text",
+		text
+	}];
+}
+function toAcpBlocks(messages, images) {
+	const blocks = messages.flatMap((message) => message.content.flatMap((block) => blockParts(block, images)));
 	return blocks.length > 0 ? blocks : [{
 		type: "text",
 		text: CONTINUE_PROMPT
 	}];
 }
+/**
+* Prompt blocks under construction. Text accumulates into one block until an image has to
+* break the run, so a transcript without images is still sent as the single block it was.
+*/
+var BlockWriter = class {
+	blocks = [];
+	pending = "";
+	write(text, separator = "\n") {
+		if (text.length === 0) return;
+		this.pending = this.pending.length === 0 ? text : `${this.pending}${separator}${text}`;
+	}
+	attach(block) {
+		this.flush();
+		this.blocks.push(block);
+	}
+	flush() {
+		if (this.pending.length === 0) return;
+		this.blocks.push({
+			type: "text",
+			text: this.pending
+		});
+		this.pending = "";
+	}
+	done() {
+		this.flush();
+		return this.blocks;
+	}
+};
 const ROLE_LABEL = {
 	user: "User",
 	assistant: "Assistant",
@@ -10689,20 +10821,42 @@ function incrementalPrompt(conversation, consumed, route, images) {
 	}
 	return toAcpBlocks(fresh, images);
 }
+/**
+* The replayed history. Text is labelled by role as one run; an image the turn can send is
+* attached in place, so rebuilding a session does not silently blind the agent to pictures
+* the user already sent.
+*/
+function writeHistory(writer, history, images) {
+	const messages = history.filter((message) => message.role in ROLE_LABEL).map((message) => [ROLE_LABEL[message.role], message.content.flatMap((block) => blockParts(block, images))]).filter(([, parts]) => parts.length > 0);
+	if (messages.length === 0) return;
+	writer.write("<conversation_history>", "\n\n");
+	for (const [order, [label, parts]] of messages.entries()) {
+		let labelled = false;
+		for (const [index, part] of parts.entries()) {
+			const separator = index === 0 && order > 0 ? "\n\n" : "\n";
+			if (part.type === "text") {
+				writer.write(labelled ? part.text : `${label}: ${part.text}`, separator);
+				labelled = true;
+				continue;
+			}
+			if (!labelled) {
+				writer.write(`${label}:`, separator);
+				labelled = true;
+			}
+			writer.attach(part);
+		}
+	}
+	writer.write("</conversation_history>");
+}
 function fullPrompt(conversation, system, images) {
 	let split = conversation.length;
 	while (split > 0 && conversation[split - 1]?.role === "user") split--;
-	const history = conversation.slice(0, split);
-	const current = conversation.slice(split);
-	const preface = [];
-	if (system !== void 0 && system.length > 0) preface.push(`<system_instructions>\n${system}\n</system_instructions>`);
-	const lines = history.filter((message) => message.role in ROLE_LABEL).map((message) => [message, messageText(message)]).filter(([, text]) => text.length > 0).map(([message, text]) => `${ROLE_LABEL[message.role]}: ${text}`);
-	if (lines.length > 0) preface.push(`<conversation_history>\n${lines.join("\n\n")}\n</conversation_history>`);
-	const blocks = toAcpBlocks(current, images);
-	return preface.length === 0 ? blocks : [{
-		type: "text",
-		text: preface.join("\n\n")
-	}, ...blocks];
+	const writer = new BlockWriter();
+	if (system !== void 0 && system.length > 0) writer.write(`<system_instructions>\n${system}\n</system_instructions>`);
+	writeHistory(writer, conversation.slice(0, split), images);
+	const preface = writer.done();
+	const blocks = toAcpBlocks(conversation.slice(split), images);
+	return preface.length === 0 ? blocks : [...preface, ...blocks];
 }
 //#endregion
 //#region src/host/service/acp-adapter.ts
@@ -10738,11 +10892,12 @@ var AcpAdapter = class extends LlmAdapter {
 	bindings = /* @__PURE__ */ new Map();
 	turns = /* @__PURE__ */ new Map();
 	retryPolicy = resolveRetryPolicy(NO_RETRY, `${PLUGIN_ID}: retryPolicy`);
-	constructor(host, profiles, contextWindows = new ContextWindows()) {
+	constructor(host, profiles, contextWindows = new ContextWindows(), capabilities = new PromptCapabilitiesCache()) {
 		super();
 		this.host = host;
 		this.profiles = profiles;
 		this.contextWindows = contextWindows;
+		this.capabilities = capabilities;
 	}
 	sync() {
 		const profiles = this.profiles();
@@ -10776,14 +10931,14 @@ var AcpAdapter = class extends LlmAdapter {
 			provider,
 			id: DEFAULT_MODEL_ID,
 			name: `${profile.displayName ?? provider} (default)`,
-			inputModalities: this.modalities(provider)
+			...this.modalities(provider)
 		});
 		if (profile.models.length > 0) return profile.models.map((model) => ({
 			provider,
 			id: model.id,
 			name: model.name ?? model.id,
 			...model.description === void 0 ? {} : { description: model.description },
-			inputModalities: this.modalities(provider)
+			...this.modalities(provider)
 		}));
 		if (!profile.discoverModels) return [fallback()];
 		try {
@@ -10794,7 +10949,7 @@ var AcpAdapter = class extends LlmAdapter {
 				id: model.id,
 				name: model.name,
 				...model.description === void 0 ? {} : { description: model.description },
-				inputModalities: this.modalities(provider)
+				...this.modalities(provider)
 			}))];
 		} catch (error) {
 			this.host.logger.warn(`${PLUGIN_ID}: model discovery for ACP agent "${provider}" failed`, error);
@@ -10812,14 +10967,15 @@ var AcpAdapter = class extends LlmAdapter {
 		return this.agent(provider, profile).discoverModels(profile.cwd ?? homedir(), signal);
 	}
 	/**
-	* Exact-model metadata. Capabilities come from the agent itself, so an agent nobody has
-	* started yet is probed once (when `discoverModels` allows it): image input from its
-	* `promptCapabilities`, reasoning efforts from its `thought_level` option, and the
-	* context window it last reported through `usage_update` (remembered across restarts),
-	* else one a "1m" token in the model's id, name or description implies.
+	* Exact-model metadata. Capabilities come from the agent itself: accepted input from the
+	* `promptCapabilities` of its ACP handshake (learned here, remembered across restarts),
+	* reasoning efforts from its `thought_level` option, and the context window it last
+	* reported through `usage_update`, else one a "1m" token in the model's id, name or
+	* description implies.
 	*/
 	async resolveModel(provider, model, signal) {
 		const profile = this.profiles().get(provider);
+		await this.learnCapabilities(provider, signal);
 		if (profile?.discoverModels === true && this.agents.get(provider)?.process.advertisedModels === void 0) await this.advertisedModels(provider, signal).catch((error) => {
 			this.host.logger.warn(`${PLUGIN_ID}: probing ACP agent "${provider}" for model metadata failed`, error);
 		});
@@ -10831,7 +10987,7 @@ var AcpAdapter = class extends LlmAdapter {
 			provider,
 			id: model,
 			name: configured?.name ?? advertised?.name ?? model,
-			inputModalities: this.modalities(provider),
+			...this.modalities(provider),
 			context: { contextWindow: configured?.contextWindow ?? this.contextWindows.get(provider, model) ?? inferContextWindow(model, configured?.name, configured?.description, advertised?.name, advertised?.description) ?? profile?.contextWindow ?? 2e5 },
 			...efforts === void 0 ? {} : { reasoning: {
 				efforts: efforts.available.map((level) => ({
@@ -10843,9 +10999,39 @@ var AcpAdapter = class extends LlmAdapter {
 			} }
 		};
 	}
-	/** Image input is offered only when the agent accepts images and dsh can read attachments. */
+	/**
+	* What the route accepts as input. dsh reads an omitted `inputModalities` as "unknown" and
+	* sends images through untouched, while an explicit list without `image` is a negative it
+	* acts on by replacing every attachment with text before the adapter is even called. So an
+	* agent whose handshake nobody has heard yet must stay silent rather than claim text only.
+	*/
 	modalities(provider) {
-		return this.agents.get(provider)?.process.supportsImages === true && this.host.readImage !== void 0 ? TEXT_AND_IMAGE : TEXT_ONLY;
+		const mode = this.profiles().get(provider)?.imageInput ?? "auto";
+		if (mode === "off" || this.host.readImage === void 0) return { inputModalities: TEXT_ONLY };
+		if (mode === "force") return { inputModalities: TEXT_AND_IMAGE };
+		const known = this.promptCapabilitiesOf(provider);
+		if (known === void 0) return {};
+		return { inputModalities: known.image ? TEXT_AND_IMAGE : TEXT_ONLY };
+	}
+	/** The running agent's handshake answer, else the one it gave for these spawn facts before. */
+	promptCapabilitiesOf(provider) {
+		const live = this.agents.get(provider)?.process.promptCapabilities;
+		if (live !== void 0) return live;
+		const profile = this.profiles().get(provider);
+		return profile === void 0 ? void 0 : this.capabilities.get(provider, spawnFacts(profile));
+	}
+	/**
+	* Make sure the ACP handshake has happened at least once, since that is where an agent
+	* states the content types it accepts. The answer is cached per route, so this starts an
+	* agent only the first time dsh asks about a route it has never heard from.
+	*/
+	async learnCapabilities(provider, signal) {
+		const profile = this.profiles().get(provider);
+		if (profile === void 0 || (profile.imageInput ?? "auto") !== "auto" || this.host.readImage === void 0) return;
+		if (this.promptCapabilitiesOf(provider) !== void 0) return;
+		await this.agent(provider, profile).probeCapabilities(signal).catch((error) => {
+			this.host.logger.warn(`${PLUGIN_ID}: asking ACP agent "${provider}" which content it accepts failed`, error);
+		});
 	}
 	/** Read every image the prompt wants, as base64 request versions; unreadable ones stay text. */
 	async readImages(wanted, signal) {
@@ -11110,6 +11296,7 @@ var AcpAdapter = class extends LlmAdapter {
 			route,
 			profile: () => this.profiles().get(route) ?? profile,
 			logger: this.host.logger,
+			onCapabilities: (capabilities) => this.capabilities.set(route, this.agents.get(route)?.facts ?? spawnFacts(profile), capabilities),
 			onPermission: (sessionId, request) => decidePermission(this.host, route, (this.profiles().get(route) ?? profile).permission, this.turns.get(sessionId), request)
 		});
 		this.agents.set(route, {
@@ -11127,10 +11314,10 @@ var AcpAdapter = class extends LlmAdapter {
 };
 //#endregion
 //#region src/host/apply.ts
-/** Where learned context windows persist: `$DSH_HOME` (default `~/.dsh`), as dsh resolves it. */
-function contextWindowsFile() {
+/** Where this plugin's learned facts persist: `$DSH_HOME` (default `~/.dsh`), as dsh resolves it. */
+function cacheFile(name) {
 	const configured = process.env.DSH_HOME?.trim();
-	return join(resolve(configured === void 0 || configured.length === 0 ? join(homedir(), ".dsh") : configured === "~" || configured.startsWith("~/") ? join(homedir(), configured.slice(1)) : configured), "cache", PLUGIN_ID, "context-windows.json");
+	return join(resolve(configured === void 0 || configured.length === 0 ? join(homedir(), ".dsh") : configured === "~" || configured.startsWith("~/") ? join(homedir(), configured.slice(1)) : configured), "cache", PLUGIN_ID, name);
 }
 /** Same request-image budget dsh-llm-pi-ai uses by default. */
 const IMAGE_POLICY = {
@@ -11185,7 +11372,7 @@ function apply(ctx, config) {
 			const attachments = ctx.get("attachments");
 			return typeof attachments?.readImageRequest !== "function" ? void 0 : (ref, signal) => attachments.readImageRequest(ref, IMAGE_POLICY, signal);
 		}
-	}, profiles, new ContextWindows(contextWindowsFile(), ctx.logger));
+	}, profiles, new ContextWindows(cacheFile("context-windows.json"), ctx.logger), new PromptCapabilitiesCache(cacheFile("prompt-capabilities.json"), ctx.logger));
 	ctx.effect(() => () => adapter.dispose(), `${PLUGIN_ID}: agents`);
 	ctx.llm.registerModelDiscovery(SETTINGS_NS, async (request, signal) => {
 		const route = request.provider ?? "";

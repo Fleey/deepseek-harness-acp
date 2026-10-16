@@ -12,6 +12,7 @@ import type {
 import type { AcpAgentProfile } from '../../shared/types.ts'
 import type { AdapterHost } from '../types/index.ts'
 import type { AcpAdvertisedModel, AcpSession } from './acp-agent.ts'
+import type { AcpPromptCapabilities } from './prompt-capabilities.ts'
 import type { PromptImage, PromptImages } from './transcript.ts'
 import type { PermissionTurn } from './permission.ts'
 import { homedir } from 'node:os'
@@ -22,6 +23,7 @@ import { AcpAgentProcess, applyConfigOptions } from './acp-agent.ts'
 import { ChunkTranslator, usageDelta } from './chunk-translator.ts'
 import { ContextWindows, inferContextWindow } from './context-windows.ts'
 import { decidePermission } from './permission.ts'
+import { PromptCapabilitiesCache } from './prompt-capabilities.ts'
 import { consumedIds, conversationOf, fullPrompt, incrementalPrompt, systemText } from './transcript.ts'
 
 interface Binding {
@@ -71,6 +73,7 @@ export class AcpAdapter extends LlmAdapter {
     private readonly host: AdapterHost,
     private readonly profiles: () => ReadonlyMap<string, AcpAgentProfile>,
     private readonly contextWindows: ContextWindows = new ContextWindows(),
+    private readonly capabilities: PromptCapabilitiesCache = new PromptCapabilitiesCache(),
   ) {
     super()
   }
@@ -107,14 +110,14 @@ export class AcpAdapter extends LlmAdapter {
     const profile = this.profiles().get(provider)
     if (profile === undefined)
       return []
-    const fallback = (): LlmModelInfo => ({ provider, id: DEFAULT_MODEL_ID, name: `${profile.displayName ?? provider} (default)`, inputModalities: this.modalities(provider) })
+    const fallback = (): LlmModelInfo => ({ provider, id: DEFAULT_MODEL_ID, name: `${profile.displayName ?? provider} (default)`, ...this.modalities(provider) })
     if (profile.models.length > 0) {
       return profile.models.map(model => ({
         provider,
         id: model.id,
         name: model.name ?? model.id,
         ...model.description === undefined ? {} : { description: model.description },
-        inputModalities: this.modalities(provider),
+        ...this.modalities(provider),
       }))
     }
     if (!profile.discoverModels)
@@ -128,7 +131,7 @@ export class AcpAdapter extends LlmAdapter {
         id: model.id,
         name: model.name,
         ...model.description === undefined ? {} : { description: model.description },
-        inputModalities: this.modalities(provider),
+        ...this.modalities(provider),
       }))]
     }
     catch (error) {
@@ -150,14 +153,15 @@ export class AcpAdapter extends LlmAdapter {
   }
 
   /**
-   * Exact-model metadata. Capabilities come from the agent itself, so an agent nobody has
-   * started yet is probed once (when `discoverModels` allows it): image input from its
-   * `promptCapabilities`, reasoning efforts from its `thought_level` option, and the
-   * context window it last reported through `usage_update` (remembered across restarts),
-   * else one a "1m" token in the model's id, name or description implies.
+   * Exact-model metadata. Capabilities come from the agent itself: accepted input from the
+   * `promptCapabilities` of its ACP handshake (learned here, remembered across restarts),
+   * reasoning efforts from its `thought_level` option, and the context window it last
+   * reported through `usage_update`, else one a "1m" token in the model's id, name or
+   * description implies.
    */
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const profile = this.profiles().get(provider)
+    await this.learnCapabilities(provider, signal)
     if (profile?.discoverModels === true && this.agents.get(provider)?.process.advertisedModels === undefined) {
       await this.advertisedModels(provider, signal).catch((error: unknown) => {
         this.host.logger.warn(`${PLUGIN_ID}: probing ACP agent "${provider}" for model metadata failed`, error)
@@ -171,7 +175,7 @@ export class AcpAdapter extends LlmAdapter {
       provider,
       id: model,
       name: configured?.name ?? advertised?.name ?? model,
-      inputModalities: this.modalities(provider),
+      ...this.modalities(provider),
       context: {
         contextWindow: configured?.contextWindow
           ?? this.contextWindows.get(provider, model)
@@ -196,9 +200,48 @@ export class AcpAdapter extends LlmAdapter {
     }
   }
 
-  /** Image input is offered only when the agent accepts images and dsh can read attachments. */
-  private modalities(provider: string): readonly ModelModality[] {
-    return this.agents.get(provider)?.process.supportsImages === true && this.host.readImage !== undefined ? TEXT_AND_IMAGE : TEXT_ONLY
+  /**
+   * What the route accepts as input. dsh reads an omitted `inputModalities` as "unknown" and
+   * sends images through untouched, while an explicit list without `image` is a negative it
+   * acts on by replacing every attachment with text before the adapter is even called. So an
+   * agent whose handshake nobody has heard yet must stay silent rather than claim text only.
+   */
+  private modalities(provider: string): { inputModalities?: readonly ModelModality[] } {
+    const mode = this.profiles().get(provider)?.imageInput ?? 'auto'
+    // Without an attachment store there are no image bytes to send, whatever the agent accepts.
+    if (mode === 'off' || this.host.readImage === undefined)
+      return { inputModalities: TEXT_ONLY }
+    if (mode === 'force')
+      return { inputModalities: TEXT_AND_IMAGE }
+    const known = this.promptCapabilitiesOf(provider)
+    if (known === undefined)
+      return {}
+    return { inputModalities: known.image ? TEXT_AND_IMAGE : TEXT_ONLY }
+  }
+
+  /** The running agent's handshake answer, else the one it gave for these spawn facts before. */
+  private promptCapabilitiesOf(provider: string): AcpPromptCapabilities | undefined {
+    const live = this.agents.get(provider)?.process.promptCapabilities
+    if (live !== undefined)
+      return live
+    const profile = this.profiles().get(provider)
+    return profile === undefined ? undefined : this.capabilities.get(provider, spawnFacts(profile))
+  }
+
+  /**
+   * Make sure the ACP handshake has happened at least once, since that is where an agent
+   * states the content types it accepts. The answer is cached per route, so this starts an
+   * agent only the first time dsh asks about a route it has never heard from.
+   */
+  private async learnCapabilities(provider: string, signal?: AbortSignal): Promise<void> {
+    const profile = this.profiles().get(provider)
+    if (profile === undefined || (profile.imageInput ?? 'auto') !== 'auto' || this.host.readImage === undefined)
+      return
+    if (this.promptCapabilitiesOf(provider) !== undefined)
+      return
+    await this.agent(provider, profile).probeCapabilities(signal).catch((error: unknown) => {
+      this.host.logger.warn(`${PLUGIN_ID}: asking ACP agent "${provider}" which content it accepts failed`, error)
+    })
   }
 
   /** Read every image the prompt wants, as base64 request versions; unreadable ones stay text. */
@@ -401,6 +444,9 @@ export class AcpAdapter extends LlmAdapter {
       route,
       profile: () => this.profiles().get(route) ?? profile,
       logger: this.host.logger,
+      // Remember the handshake answer against the facts that produced it: a route repointed
+      // at another command answers for another agent.
+      onCapabilities: capabilities => this.capabilities.set(route, this.agents.get(route)?.facts ?? spawnFacts(profile), capabilities),
       onPermission: (sessionId, request) => decidePermission(
         this.host,
         route,
