@@ -2,6 +2,19 @@
 
 DeepSeek Harness 桌面插件：用 ACP（[Agent Client Protocol](https://agentclientprotocol.com)）把外部 Agent（Codex、Claude Code、Gemini CLI 等）注册成 dsh 的模型提供方。在模型选择器里选中它，对话就会交给这个 Agent 处理。
 
+## 插件界面
+
+<img width="1574" height="1432" alt="image" src="https://github.com/user-attachments/assets/55c8c3f8-987f-4574-8084-2ea43495e784" />
+
+支持通过acp协议发现模型
+
+<img width="1636" height="1576" alt="image" src="https://github.com/user-attachments/assets/a61e6342-7a74-40b7-b7b1-0a260c344d5b" />
+
+支持导入标准acp配置json进行导入
+
+<img width="1634" height="1364" alt="image" src="https://github.com/user-attachments/assets/967986ab-d5ee-4ed3-966d-5322e7f58d38" />
+
+
 ## 工作方式
 
 - 每个配置项是一个 provider 路由，插件按需拉起该 Agent 子进程（stdio JSON-RPC），进程常驻复用。
