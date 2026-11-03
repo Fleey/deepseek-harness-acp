@@ -7,8 +7,15 @@ const MODELS = [
   { value: 'mock-smart', name: 'Mock Smart' },
 ]
 
+/** Context windows advertised in the legacy `models` list, as CodeBuddy does. */
+const WINDOWS = { 'mock-fast': 300_000, 'mock-smart': 400_000 }
+
 const sessions = new Map()
 const requireAuth = process.env.MOCK_REQUIRE_AUTH === '1'
+// CodeBuddy states each model's window in `models[]._meta` and starts new sessions on the
+// model last picked in this process.
+const likeCodeBuddy = process.env.MOCK_LIKE_CODEBUDDY === '1'
+let lastModel = 'mock-fast'
 let authenticated = false
 let counter = 0
 
@@ -105,7 +112,7 @@ acp.agent({ name: 'mock-agent' })
       throw acp.RequestError.authRequired()
     const sessionId = `s${++counter}`
     sessions.set(sessionId, {
-      model: 'mock-fast',
+      model: likeCodeBuddy ? lastModel : 'mock-fast',
       effort: 'medium',
       cwd: params.cwd,
       turn: 0,
@@ -113,7 +120,11 @@ acp.agent({ name: 'mock-agent' })
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     })
     process.stderr.write(`new-session ${sessionId}\n`)
-    return { sessionId, configOptions: configOptions(sessions.get(sessionId)) }
+    const session = sessions.get(sessionId)
+    if (!likeCodeBuddy)
+      return { sessionId, configOptions: configOptions(session) }
+    const availableModels = MODELS.map(model => ({ modelId: model.value, name: model.name, _meta: { maxInputTokens: WINDOWS[model.value] } }))
+    return { sessionId, configOptions: configOptions(session), models: { currentModelId: session.model, availableModels } }
   })
   .onRequest('session/set_config_option', ({ params }) => {
     const session = sessions.get(params.sessionId)
@@ -126,6 +137,7 @@ acp.agent({ name: 'mock-agent' })
     if (!MODELS.some(model => model.value === params.value))
       throw new Error(`unknown model ${params.value}`)
     session.model = params.value
+    lastModel = params.value
     if (!effortsOf(session.model).some(level => level.value === session.effort))
       session.effort = 'medium'
     return { configOptions: configOptions(session) }

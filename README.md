@@ -8,9 +8,10 @@ DeepSeek Harness 桌面插件：用 ACP（[Agent Client Protocol](https://agentc
 - 每个 dsh 会话对应一个 ACP 会话，后续轮次只发送新增的用户消息；历史对不上（切过模型、被压缩）时自动新建 ACP 会话，并把历史压平成 `<conversation_history>` 一次性带过去。Agent 收图时历史里的图片按原位置作为 `image` 块重发，不会被压成文本。
 - 模型列表来自 Agent 的 `configOptions`（`category: "model"`），兼容旧版 `models` + `session/set_model`；`default` 表示用 Agent 自己的默认模型。
 - 模型元数据来自 Agent 本身（需要时会先启动一次 Agent 探测，受 `discoverModels` 控制）：
-  - **推理等级**：Agent 的 `thought_level` 选项映射成 dsh 的推理等级，模型选择器里出现「推理等级」菜单；选中的等级经 `session/set_config_option` 设置，Agent 会话初始的等级作为默认等级上报（选择器里打勾的那一项，不再额外出现 dsh 自己的 Default）；Agent 对当前模型不提供的等级会被忽略并记日志。
+  - **推理等级**：Agent 的 `thought_level` 选项映射成 dsh 的推理等级，模型选择器里出现「推理等级」菜单；选中的等级经 `session/set_config_option` 设置，Agent 会话初始的等级作为默认等级上报（选择器里打勾的那一项，不再额外出现 dsh 自己的 Default）；Agent 对当前模型不提供的等级会被忽略并记日志。不同模型提供的等级不同（如 CodeBuddy 的 `hy3` 有 `minimal`…`max`，`hy4-preview` 只有 `high`），而 Agent 只列当前模型的等级，所以 `discoverModels` 开着时插件会在一个共用的探测会话里切到该模型读一次，按模型记住。
   - **图片输入**：输入类型按 ACP 协议问 Agent 本人——`initialize` 应答里的 `promptCapabilities`。dsh 解析元数据时若还没人跟这个路由握过手，插件会先做一次握手（只握手，不开会话、不发轮次）把能力问出来，答案按路由记在 `$DSH_HOME/cache/dsh-tauri-acp/prompt-capabilities.json`（连同启动命令的指纹，换了命令即作废），重启后首轮直接可用。声明 `promptCapabilities.image` 且 dsh 挂了附件服务时模型声明为 文本+图片，图片按 dsh 的请求尺寸（与 pi-ai 默认相同：≤4MP、≤1MB）重新编码后作为 ACP `image` 块发送。能力未知时不作声（dsh 把缺省读作「未知」并原样下发图片），而不是谎报纯文本——显式报纯文本会让 dsh 在进入插件之前就把图片换成文本占位。`imageInput` 可覆盖 Agent 漏报的能力。
-  - **上下文窗口**：优先用 `models[].contextWindow`，其次用 Agent 通过 `usage_update.size` 上报的大小（对话一轮后才知道，记在 `$DSH_HOME/cache/dsh-tauri-acp/context-windows.json`，重启后首轮直接可用），再次是模型 id、名称或描述里的 `1m` 标记（如 `claude-fable-5-1[1m]`、`(1M context)`，按 1000000 算），最后是 `contextWindow` 配置。ACP 在一轮对话前不提供窗口大小，所以从没跑过的模型首轮仍按配置值算。
+  - **上下文窗口**：优先用 `models[].contextWindow`，其次用 Agent 通过 `usage_update.size` 上报的大小（对话一轮后才知道，记在 `$DSH_HOME/cache/dsh-tauri-acp/context-windows.json`，重启后首轮直接可用），再次是 Agent 模型列表里写明的窗口（CodeBuddy 在 `session/new` 应答的 `models.availableModels[]._meta.maxInputTokens` 里给出），再次是模型 id、名称或描述里的 `1m` 标记（如 `claude-fable-5-1[1m]`、`(1M context)`，按 1000000 算），最后是 `contextWindow` 配置。ACP 本身在一轮对话前不提供窗口大小，所以 Agent 不在模型列表里写明时，从没跑过的模型首轮仍按配置值算。
+  - **默认模型**：`default` 指 Agent 进程首个会话所在的模型。有的 Agent 会把上次选的模型带进新会话（CodeBuddy 就是），所以插件选 `default` 时会显式切回这个模型，而不是沿用新会话碰巧所在的模型。
 - `agent_message_chunk` 映射为正文，`agent_thought_chunk`、工具调用、计划映射为推理块；`usage` 按会话累计值做差分。
 - 工作目录取当前 dsh 会话的 workspace，取不到时回退到 `cwd` 配置或用户主目录。
 - Agent 的权限请求默认走 dsh 原生审批框（`ctx.approval`）。
@@ -95,12 +96,12 @@ link 模式下，插件会从本仓库的 `node_modules` 解析 `@deepseek-ai/ds
 | `cwd` | 会话 workspace | 子进程目录，以及取不到会话 workspace 时的 ACP 会话目录 |
 | `authMethod` | 无 | 握手后调用 `authenticate` 的方法 id；出错信息会列出 Agent 支持的方法 |
 | `models` | `[]` | 手动声明模型（`id`、`name`、`description`、`contextWindow`）；声明后不再自动发现 |
-| `discoverModels` | `true` | 未声明模型时，启动 Agent 读取它公布的模型列表 |
+| `discoverModels` | `true` | 未声明模型时，启动 Agent 读取它公布的模型列表；也允许插件在探测会话里切换模型来读各模型的推理等级 |
 | `permission` | `ask` | `ask` 走 dsh 审批框（无审批服务时降级为 `read-only`）；`allow` 全部允许；`read-only` 只允许 read/search/think/fetch；`reject` 全部拒绝 |
 | `imageInput` | `auto` | `auto` 按 Agent 在 ACP 握手里公布的 `promptCapabilities.image` 判断；`force` 不管公布什么都开（Agent 漏报时用）；`off` 一律按文本占位。没挂附件服务时三者都是纯文本 |
 | `systemPrompt` | `drop` | `forward` 会把 dsh 系统提示词包在 `<system_instructions>` 里发给 Agent。dsh 提示词描述的是 dsh 自己的工具，一般不建议转发 |
 | `showToolCalls` | `true` | 把 Agent 的工具调用和计划显示在推理块里 |
-| `contextWindow` | `200000` | 上报给 dsh 的上下文窗口（用于压缩策略）；Agent 通过 `usage_update` 报告过大小、或模型带 `1m` 标记时以那个值为准 |
+| `contextWindow` | `200000` | 上报给 dsh 的上下文窗口（用于压缩策略）；Agent 通过 `usage_update` 报告过大小、在模型列表里写明了窗口、或模型带 `1m` 标记时以那个值为准 |
 | `startupTimeoutMs` | `60000` | 握手超时 |
 | `idleTimeoutMs` | `600000` | 流式输出空闲超时，`0` 关闭 |
 

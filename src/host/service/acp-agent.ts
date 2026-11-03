@@ -27,6 +27,8 @@ export interface AcpAdvertisedModel {
   id: string
   name: string
   description?: string
+  /** The model's context window, when the agent states it ahead of any turn. */
+  contextWindow?: number
 }
 
 export interface AcpSessionModels {
@@ -72,7 +74,16 @@ interface LiveAgent {
 
 interface LegacyModels {
   currentModelId?: string
-  availableModels?: Array<{ modelId: string, name?: string, description?: string | null }>
+  availableModels?: Array<{ modelId: string, name?: string, description?: string | null, _meta?: Record<string, unknown> | null }>
+}
+
+/** What the agent knows about its default model and levels, read from a process's first session. */
+interface AgentDefaults {
+  generation: number
+  model?: string
+  efforts?: AcpSessionEfforts
+  /** Whether switching models answers with the new model's config options. */
+  configurable: boolean
 }
 
 const AUTH_REQUIRED_CODE = -32000
@@ -94,6 +105,11 @@ export function sessionEfforts(options: readonly SessionConfigOption[] | null | 
   return option === undefined || option.available.length === 0 ? undefined : { configId: option.id, current: option.current, initial: option.current, available: option.available }
 }
 
+/** A copy that stays at the level the session started on, whatever later turns pick. */
+function snapshotEfforts(efforts: AcpSessionEfforts): AcpSessionEfforts {
+  return { ...efforts, current: efforts.initial, available: [...efforts.available] }
+}
+
 /** Fold a fresh `configOptions` list (set_config_option answer or config_option_update) into a session. */
 export function applyConfigOptions(session: AcpSession, options: readonly SessionConfigOption[] | null | undefined): void {
   const model = selectOption(options, 'model')
@@ -106,16 +122,36 @@ export function applyConfigOptions(session: AcpSession, options: readonly Sessio
     delete session.efforts
 }
 
+/**
+ * Context window an agent states for one model in its legacy `models` list. CodeBuddy puts
+ * it in `_meta.maxInputTokens` there and nowhere else before a turn runs.
+ */
+function advertisedWindow(meta: Record<string, unknown> | null | undefined): number | undefined {
+  const size = meta?.maxInputTokens
+  return typeof size === 'number' && Number.isFinite(size) && size > 0 ? size : undefined
+}
+
 export function sessionModels(response: NewSessionResponse): AcpSessionModels {
+  const legacy = Reflect.get(response, 'models') as LegacyModels | null | undefined
+  const windows = new Map<string, number>()
+  for (const entry of legacy?.availableModels ?? []) {
+    const size = advertisedWindow(entry._meta)
+    if (size !== undefined)
+      windows.set(entry.modelId, size)
+  }
+  // Agents that send both lists keep the per-model facts in the legacy one only.
+  const withWindow = (model: AcpAdvertisedModel): AcpAdvertisedModel => {
+    const size = windows.get(model.id)
+    return size === undefined ? model : { ...model, contextWindow: size }
+  }
   const option = selectOption(response.configOptions, 'model')
   if (option !== undefined)
-    return { configId: option.id, legacy: false, current: option.current, available: option.available }
-  const legacy = Reflect.get(response, 'models') as LegacyModels | null | undefined
+    return { configId: option.id, legacy: false, current: option.current, available: option.available.map(withWindow) }
   if (legacy?.availableModels !== undefined) {
     return {
       legacy: true,
       ...legacy.currentModelId === undefined ? {} : { current: legacy.currentModelId },
-      available: legacy.availableModels.map(entry => ({
+      available: legacy.availableModels.map(entry => withWindow({
         id: entry.modelId,
         name: entry.name ?? entry.modelId,
         ...entry.description ? { description: entry.description } : {},
@@ -149,8 +185,11 @@ export class AcpAgentProcess {
   private stderrTail = ''
   private readonly listeners = new Map<string, (update: SessionUpdate) => void>()
   private advertised: AcpAdvertisedModel[] | undefined
-  private efforts: AcpSessionEfforts | undefined
-  private discovering: Promise<readonly AcpAdvertisedModel[]> | undefined
+  private defaults: AgentDefaults | undefined
+  /** Thought levels per agent model, as offered right after switching to it; null when it offers none. */
+  private readonly modelEfforts = new Map<string, AcpSessionEfforts | null>()
+  private probe: Promise<AcpSession> | undefined
+  private probing: Promise<unknown> = Promise.resolve()
 
   constructor(private readonly options: AcpAgentOptions) {}
 
@@ -181,9 +220,33 @@ export class AcpAgentProcess {
     return this.advertised
   }
 
-  /** The thought levels the agent offered on its latest session, if it offers any. */
-  get advertisedEfforts(): AcpSessionEfforts | undefined {
-    return this.efforts
+  /** The model the agent starts a fresh process on, which is what dsh's "default" model means. */
+  get defaultModel(): string | undefined {
+    return this.defaults?.model
+  }
+
+  /**
+   * The thought levels the agent offers for one model, if it offers any. Levels differ per
+   * model; one not switched to yet reads as the default model's.
+   */
+  effortsFor(model: string): AcpSessionEfforts | undefined {
+    const id = this.agentModel(model)
+    const known = id === undefined ? undefined : this.modelEfforts.get(id)
+    return known === undefined ? this.defaults?.efforts : known ?? undefined
+  }
+
+  /**
+   * Learn the thought levels the agent offers for one model. An agent lists only the current
+   * model's levels, so this switches a shared probe session to the model once.
+   */
+  async learnEfforts(model: string, cwd: string, signal?: AbortSignal): Promise<void> {
+    if (this.knowsEfforts(model))
+      return
+    await this.withAbort(this.serial(async () => {
+      const session = await this.probeSession(cwd)
+      if (!this.knowsEfforts(model))
+        await this.selectModel(session, model)
+    }), signal)
   }
 
   async newSession(cwd: string, signal?: AbortSignal): Promise<AcpSession> {
@@ -209,12 +272,25 @@ export class AcpAgentProcess {
     if (models.available.length > 0)
       this.advertised = models.available
     const efforts = sessionEfforts(response.configOptions)
-    this.efforts = efforts
+    // Agents may carry the last picked model into new sessions (CodeBuddy does), so only a
+    // process's first session shows which model the agent itself starts on.
+    if (this.defaults?.generation !== live.generation) {
+      this.defaults = {
+        generation: live.generation,
+        ...models.current === undefined ? {} : { model: models.current },
+        ...efforts === undefined ? {} : { efforts: snapshotEfforts(efforts) },
+        configurable: models.configId !== undefined,
+      }
+    }
+    if (models.current !== undefined)
+      this.recordEfforts(models.current, efforts)
     return { sessionId: response.sessionId, generation: live.generation, models, ...efforts === undefined ? {} : { efforts } }
   }
 
+  /** Switch a session to a model; "default" switches back to the model the agent starts on. */
   async selectModel(session: AcpSession, model: string, signal?: AbortSignal): Promise<void> {
-    if (model === DEFAULT_MODEL_ID || model === session.models.current)
+    const target = this.agentModel(model)
+    if (target === undefined || target === session.models.current)
       return
     const live = this.requireLive(session.generation)
     const { configId, legacy } = session.models
@@ -223,12 +299,17 @@ export class AcpAgentProcess {
         const response = await this.withAbort(live.connection.agent.request(methods.agent.session.setConfigOption, {
           sessionId: session.sessionId,
           configId,
-          value: model,
+          value: target,
         }), signal)
-        applyConfigOptions(session, response.configOptions)
+        // The levels on offer, and the one the session now sits on, belong to the new model.
+        if (response.configOptions != null) {
+          delete session.efforts
+          applyConfigOptions(session, response.configOptions)
+          this.recordEfforts(target, session.efforts)
+        }
       }
       else if (legacy) {
-        await this.withAbort(live.connection.agent.request('session/set_model', { sessionId: session.sessionId, modelId: model }), signal)
+        await this.withAbort(live.connection.agent.request('session/set_model', { sessionId: session.sessionId, modelId: target }), signal)
       }
       else {
         throw new LlmError(
@@ -241,12 +322,12 @@ export class AcpAgentProcess {
       if (error instanceof LlmError)
         throw error
       throw new LlmError(
-        `${PLUGIN_ID}: ACP agent "${this.options.route}" rejected model "${model}": ${describeError(error)}`,
+        `${PLUGIN_ID}: ACP agent "${this.options.route}" rejected model "${target}": ${describeError(error)}`,
         'MODEL_NOT_FOUND',
         { cause: error },
       )
     }
-    session.models.current = model
+    session.models.current = target
   }
 
   /**
@@ -313,20 +394,18 @@ export class AcpAgentProcess {
     if (this.advertised !== undefined)
       return this.advertised
     // Catalog reads resolve every model at once; they share one probe session.
-    this.discovering ??= this.newSession(cwd).then((session) => {
-      this.closeSession(session)
+    return this.withAbort(this.serial(async () => {
+      const session = await this.probeSession(cwd)
       this.advertised ??= session.models.available
       return this.advertised
-    }).finally(() => {
-      this.discovering = undefined
-    })
-    return this.withAbort(this.discovering, signal)
+    }), signal)
   }
 
   restart(): void {
     this.advertised = undefined
-    this.efforts = undefined
-    this.discovering = undefined
+    this.defaults = undefined
+    this.modelEfforts.clear()
+    this.probe = undefined
     this.teardown()
   }
 
@@ -346,6 +425,38 @@ export class AcpAgentProcess {
     live.child.stdin?.end()
     if (live.child.exitCode === null && live.child.signalCode === null)
       live.child.kill('SIGTERM')
+  }
+
+  private agentModel(model: string): string | undefined {
+    return model === DEFAULT_MODEL_ID ? this.defaults?.model : model
+  }
+
+  private knowsEfforts(model: string): boolean {
+    // Without config options on a switch there is nothing more to learn than the default's.
+    if (this.defaults?.generation === this.generation && !this.defaults.configurable)
+      return true
+    const id = this.agentModel(model)
+    return id !== undefined && this.modelEfforts.has(id)
+  }
+
+  private recordEfforts(model: string, efforts: AcpSessionEfforts | undefined): void {
+    this.modelEfforts.set(model, efforts === undefined ? null : snapshotEfforts(efforts))
+  }
+
+  /** Probes share one idle session per agent process, so reading metadata never piles up sessions. */
+  private async probeSession(cwd: string): Promise<AcpSession> {
+    const existing = await this.probe?.catch(() => undefined)
+    if (existing !== undefined && existing.generation === this.generation)
+      return existing
+    this.probe = this.newSession(cwd)
+    return this.probe
+  }
+
+  /** Run probe work one task at a time, since every task may switch the probe session's model. */
+  private serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.probing.then(task)
+    this.probing = run.catch(() => {})
+    return run
   }
 
   private requireLive(generation: number): LiveAgent {

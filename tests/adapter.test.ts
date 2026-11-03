@@ -236,6 +236,25 @@ describe('acp adapter', () => {
     expect((await withImages.resolveModel(ROUTE, 'mock-smart')).inputModalities).toEqual(['text', 'image'])
   })
 
+  it('reports the thought levels the agent offers for each model', async () => {
+    const adapter = create()
+    const [smart, fast, fallback] = await Promise.all(['mock-smart', 'mock-fast', 'default'].map(model => adapter.resolveModel(ROUTE, model)))
+    expect(smart!.reasoning).toMatchObject({ defaultEffort: 'medium' })
+    expect(smart!.reasoning!.efforts.map(level => level.id)).toEqual(['low', 'medium', 'high', 'max'])
+    expect(fast!.reasoning!.efforts.map(level => level.id)).toEqual(['low', 'medium', 'high'])
+    expect(fallback!.reasoning!.efforts.map(level => level.id)).toEqual(['low', 'medium', 'high'])
+    const result = await run(adapter, request([user('probe')], { model: 'mock-smart', reasoningEffort: 'max' as any }))
+    expect(result.text).toBe('effort:max|images:|probe')
+  })
+
+  it('keeps "default" on the model the agent starts on after other models ran', async () => {
+    const adapter = create(profile({ env: { MOCK_LIKE_CODEBUDDY: '1' } }))
+    expect((await run(adapter, request([user('hi')], { model: 'mock-smart' }))).text).toContain('echo[mock-smart|')
+    // The agent now opens new sessions on mock-smart; "default" still means its own default.
+    expect((await run(adapter, request([user('hi')], { model: 'default', sessionId: 'dsh-2' as any }))).text).toContain('echo[mock-fast|')
+    expect((await adapter.resolveModel(ROUTE, 'default')).reasoning!.efforts.map(level => level.id)).toEqual(['low', 'medium', 'high'])
+  })
+
   it('applies the selected reasoning effort and restores the agent default', async () => {
     const adapter = create()
     const history: any[] = [user('probe one')]
@@ -258,6 +277,17 @@ describe('acp adapter', () => {
     const declared = create(profile({ models: [{ id: 'mock-smart', contextWindow: 64_000 }] }))
     await run(declared, request([user('probe')], { model: 'mock-smart' }))
     expect((await declared.resolveModel(ROUTE, 'mock-smart')).context).toEqual({ contextWindow: 64_000 })
+  })
+
+  it('reads the context window each model advertises, "default" included', async () => {
+    const adapter = create(profile({ env: { MOCK_LIKE_CODEBUDDY: '1' } }))
+    const [fast, smart, fallback] = await Promise.all(['mock-fast', 'mock-smart', 'default'].map(model => adapter.resolveModel(ROUTE, model)))
+    expect(fast!.context).toEqual({ contextWindow: 300_000 })
+    expect(smart!.context).toEqual({ contextWindow: 400_000 })
+    expect(fallback!.context).toEqual({ contextWindow: 300_000 })
+    // A window reported during a turn is the agent's own word for what it runs, so it wins.
+    await run(adapter, request([user('probe')], { model: 'mock-smart' }))
+    expect((await adapter.resolveModel(ROUTE, 'mock-smart')).context).toEqual({ contextWindow: 123_456 })
   })
 
   it('remembers learned context windows across restarts', async () => {

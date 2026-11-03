@@ -155,22 +155,22 @@ export class AcpAdapter extends LlmAdapter {
   /**
    * Exact-model metadata. Capabilities come from the agent itself: accepted input from the
    * `promptCapabilities` of its ACP handshake (learned here, remembered across restarts),
-   * reasoning efforts from its `thought_level` option, and the context window it last
-   * reported through `usage_update`, else one a "1m" token in the model's id, name or
-   * description implies.
+   * reasoning efforts from the `thought_level` option it offers for this very model, and the
+   * context window it last reported through `usage_update`, else the one its model list
+   * states, else one a "1m" token in the model's id, name or description implies.
    */
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const profile = this.profiles().get(provider)
     await this.learnCapabilities(provider, signal)
-    if (profile?.discoverModels === true && this.agents.get(provider)?.process.advertisedModels === undefined) {
-      await this.advertisedModels(provider, signal).catch((error: unknown) => {
-        this.host.logger.warn(`${PLUGIN_ID}: probing ACP agent "${provider}" for model metadata failed`, error)
-      })
-    }
+    if (profile?.discoverModels === true)
+      await this.learnModel(provider, profile, model, signal)
     const process = this.agents.get(provider)?.process
     const configured = profile?.models.find(entry => entry.id === model)
     const advertised = process?.advertisedModels?.find(entry => entry.id === model)
-    const efforts = process?.advertisedEfforts
+    // "default" runs on whichever model the agent itself starts on.
+    const agentModel = model === DEFAULT_MODEL_ID ? process?.defaultModel : model
+    const advertisedWindow = process?.advertisedModels?.find(entry => entry.id === agentModel)?.contextWindow
+    const efforts = process?.effortsFor(model)
     return {
       provider,
       id: model,
@@ -179,6 +179,7 @@ export class AcpAdapter extends LlmAdapter {
       context: {
         contextWindow: configured?.contextWindow
           ?? this.contextWindows.get(provider, model)
+          ?? advertisedWindow
           ?? inferContextWindow(model, configured?.name, configured?.description, advertised?.name, advertised?.description)
           ?? profile?.contextWindow
           ?? DEFAULT_CONTEXT_WINDOW,
@@ -197,6 +198,21 @@ export class AcpAdapter extends LlmAdapter {
               ...efforts.available.some(level => level.id === efforts.initial) ? { defaultEffort: efforts.initial as ReasoningEffortId } : {},
             },
           },
+    }
+  }
+
+  /**
+   * Ask the agent about one model before dsh uses it: the models it advertises (with any
+   * context windows they state) and the thought levels it offers for that model.
+   */
+  private async learnModel(provider: string, profile: AcpAgentProfile, model: string, signal?: AbortSignal): Promise<void> {
+    try {
+      if (this.agents.get(provider)?.process.advertisedModels === undefined)
+        await this.advertisedModels(provider, signal)
+      await this.agent(provider, profile).learnEfforts(model, profile.cwd ?? homedir(), signal)
+    }
+    catch (error) {
+      this.host.logger.warn(`${PLUGIN_ID}: probing ACP agent "${provider}" for model metadata failed`, error)
     }
   }
 
