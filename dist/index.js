@@ -10148,6 +10148,14 @@ function sessionEfforts(options) {
 		available: option.available
 	};
 }
+/** A copy that stays at the level the session started on, whatever later turns pick. */
+function snapshotEfforts(efforts) {
+	return {
+		...efforts,
+		current: efforts.initial,
+		available: [...efforts.available]
+	};
+}
 /** Fold a fresh `configOptions` list (set_config_option answer or config_option_update) into a session. */
 function applyConfigOptions(session, options) {
 	const model = selectOption(options, "model");
@@ -10159,19 +10167,39 @@ function applyConfigOptions(session, options) {
 	};
 	else if (options?.some((item) => item.id === session.efforts?.configId) === false) delete session.efforts;
 }
+/**
+* Context window an agent states for one model in its legacy `models` list. CodeBuddy puts
+* it in `_meta.maxInputTokens` there and nowhere else before a turn runs.
+*/
+function advertisedWindow(meta) {
+	const size = meta?.maxInputTokens;
+	return typeof size === "number" && Number.isFinite(size) && size > 0 ? size : void 0;
+}
 function sessionModels(response) {
+	const legacy = Reflect.get(response, "models");
+	const windows = /* @__PURE__ */ new Map();
+	for (const entry of legacy?.availableModels ?? []) {
+		const size = advertisedWindow(entry._meta);
+		if (size !== void 0) windows.set(entry.modelId, size);
+	}
+	const withWindow = (model) => {
+		const size = windows.get(model.id);
+		return size === void 0 ? model : {
+			...model,
+			contextWindow: size
+		};
+	};
 	const option = selectOption(response.configOptions, "model");
 	if (option !== void 0) return {
 		configId: option.id,
 		legacy: false,
 		current: option.current,
-		available: option.available
+		available: option.available.map(withWindow)
 	};
-	const legacy = Reflect.get(response, "models");
 	if (legacy?.availableModels !== void 0) return {
 		legacy: true,
 		...legacy.currentModelId === void 0 ? {} : { current: legacy.currentModelId },
-		available: legacy.availableModels.map((entry) => ({
+		available: legacy.availableModels.map((entry) => withWindow({
 			id: entry.modelId,
 			name: entry.name ?? entry.modelId,
 			...entry.description ? { description: entry.description } : {}
@@ -10201,8 +10229,11 @@ var AcpAgentProcess = class {
 	stderrTail = "";
 	listeners = /* @__PURE__ */ new Map();
 	advertised;
-	efforts;
-	discovering;
+	defaults;
+	/** Thought levels per agent model, as offered right after switching to it; null when it offers none. */
+	modelEfforts = /* @__PURE__ */ new Map();
+	probe;
+	probing = Promise.resolve();
 	constructor(options) {
 		this.options = options;
 	}
@@ -10227,9 +10258,29 @@ var AcpAgentProcess = class {
 	get advertisedModels() {
 		return this.advertised;
 	}
-	/** The thought levels the agent offered on its latest session, if it offers any. */
-	get advertisedEfforts() {
-		return this.efforts;
+	/** The model the agent starts a fresh process on, which is what dsh's "default" model means. */
+	get defaultModel() {
+		return this.defaults?.model;
+	}
+	/**
+	* The thought levels the agent offers for one model, if it offers any. Levels differ per
+	* model; one not switched to yet reads as the default model's.
+	*/
+	effortsFor(model) {
+		const id = this.agentModel(model);
+		const known = id === void 0 ? void 0 : this.modelEfforts.get(id);
+		return known === void 0 ? this.defaults?.efforts : known ?? void 0;
+	}
+	/**
+	* Learn the thought levels the agent offers for one model. An agent lists only the current
+	* model's levels, so this switches a shared probe session to the model once.
+	*/
+	async learnEfforts(model, cwd, signal) {
+		if (this.knowsEfforts(model)) return;
+		await this.withAbort(this.serial(async () => {
+			const session = await this.probeSession(cwd);
+			if (!this.knowsEfforts(model)) await this.selectModel(session, model);
+		}), signal);
 	}
 	async newSession(cwd, signal) {
 		const live = await this.ensure(signal);
@@ -10250,7 +10301,13 @@ var AcpAgentProcess = class {
 		const models = sessionModels(response);
 		if (models.available.length > 0) this.advertised = models.available;
 		const efforts = sessionEfforts(response.configOptions);
-		this.efforts = efforts;
+		if (this.defaults?.generation !== live.generation) this.defaults = {
+			generation: live.generation,
+			...models.current === void 0 ? {} : { model: models.current },
+			...efforts === void 0 ? {} : { efforts: snapshotEfforts(efforts) },
+			configurable: models.configId !== void 0
+		};
+		if (models.current !== void 0) this.recordEfforts(models.current, efforts);
 		return {
 			sessionId: response.sessionId,
 			generation: live.generation,
@@ -10258,26 +10315,34 @@ var AcpAgentProcess = class {
 			...efforts === void 0 ? {} : { efforts }
 		};
 	}
+	/** Switch a session to a model; "default" switches back to the model the agent starts on. */
 	async selectModel(session, model, signal) {
-		if (model === "default" || model === session.models.current) return;
+		const target = this.agentModel(model);
+		if (target === void 0 || target === session.models.current) return;
 		const live = this.requireLive(session.generation);
 		const { configId, legacy } = session.models;
 		try {
-			if (configId !== void 0) applyConfigOptions(session, (await this.withAbort(live.connection.agent.request(methods.agent.session.setConfigOption, {
+			if (configId !== void 0) {
+				const response = await this.withAbort(live.connection.agent.request(methods.agent.session.setConfigOption, {
+					sessionId: session.sessionId,
+					configId,
+					value: target
+				}), signal);
+				if (response.configOptions != null) {
+					delete session.efforts;
+					applyConfigOptions(session, response.configOptions);
+					this.recordEfforts(target, session.efforts);
+				}
+			} else if (legacy) await this.withAbort(live.connection.agent.request("session/set_model", {
 				sessionId: session.sessionId,
-				configId,
-				value: model
-			}), signal)).configOptions);
-			else if (legacy) await this.withAbort(live.connection.agent.request("session/set_model", {
-				sessionId: session.sessionId,
-				modelId: model
+				modelId: target
 			}), signal);
 			else throw new LlmError(`${PLUGIN_ID}: ACP agent "${this.options.route}" does not expose model selection; use model "${DEFAULT_MODEL_ID}"`, "MODEL_NOT_FOUND");
 		} catch (error) {
 			if (error instanceof LlmError) throw error;
-			throw new LlmError(`${PLUGIN_ID}: ACP agent "${this.options.route}" rejected model "${model}": ${describeError(error)}`, "MODEL_NOT_FOUND", { cause: error });
+			throw new LlmError(`${PLUGIN_ID}: ACP agent "${this.options.route}" rejected model "${target}": ${describeError(error)}`, "MODEL_NOT_FOUND", { cause: error });
 		}
-		session.models.current = model;
+		session.models.current = target;
 	}
 	/**
 	* Apply a dsh reasoning effort through the agent's `thought_level` option. Unknown efforts
@@ -10331,19 +10396,17 @@ var AcpAgentProcess = class {
 	}
 	async discoverModels(cwd, signal) {
 		if (this.advertised !== void 0) return this.advertised;
-		this.discovering ??= this.newSession(cwd).then((session) => {
-			this.closeSession(session);
+		return this.withAbort(this.serial(async () => {
+			const session = await this.probeSession(cwd);
 			this.advertised ??= session.models.available;
 			return this.advertised;
-		}).finally(() => {
-			this.discovering = void 0;
-		});
-		return this.withAbort(this.discovering, signal);
+		}), signal);
 	}
 	restart() {
 		this.advertised = void 0;
-		this.efforts = void 0;
-		this.discovering = void 0;
+		this.defaults = void 0;
+		this.modelEfforts.clear();
+		this.probe = void 0;
 		this.teardown();
 	}
 	dispose() {
@@ -10359,6 +10422,30 @@ var AcpAgentProcess = class {
 		live.connection.close();
 		live.child.stdin?.end();
 		if (live.child.exitCode === null && live.child.signalCode === null) live.child.kill("SIGTERM");
+	}
+	agentModel(model) {
+		return model === "default" ? this.defaults?.model : model;
+	}
+	knowsEfforts(model) {
+		if (this.defaults?.generation === this.generation && !this.defaults.configurable) return true;
+		const id = this.agentModel(model);
+		return id !== void 0 && this.modelEfforts.has(id);
+	}
+	recordEfforts(model, efforts) {
+		this.modelEfforts.set(model, efforts === void 0 ? null : snapshotEfforts(efforts));
+	}
+	/** Probes share one idle session per agent process, so reading metadata never piles up sessions. */
+	async probeSession(cwd) {
+		const existing = await this.probe?.catch(() => void 0);
+		if (existing !== void 0 && existing.generation === this.generation) return existing;
+		this.probe = this.newSession(cwd);
+		return this.probe;
+	}
+	/** Run probe work one task at a time, since every task may switch the probe session's model. */
+	serial(task) {
+		const run = this.probing.then(task);
+		this.probing = run.catch(() => {});
+		return run;
 	}
 	requireLive(generation) {
 		const live = this.live;
@@ -10416,7 +10503,7 @@ var AcpAgentProcess = class {
 					clientCapabilities: {},
 					clientInfo: {
 						name: PLUGIN_ID,
-						version: "0.2.0"
+						version: "0.2.1"
 					}
 				}),
 				exited,
@@ -10969,26 +11056,26 @@ var AcpAdapter = class extends LlmAdapter {
 	/**
 	* Exact-model metadata. Capabilities come from the agent itself: accepted input from the
 	* `promptCapabilities` of its ACP handshake (learned here, remembered across restarts),
-	* reasoning efforts from its `thought_level` option, and the context window it last
-	* reported through `usage_update`, else one a "1m" token in the model's id, name or
-	* description implies.
+	* reasoning efforts from the `thought_level` option it offers for this very model, and the
+	* context window it last reported through `usage_update`, else the one its model list
+	* states, else one a "1m" token in the model's id, name or description implies.
 	*/
 	async resolveModel(provider, model, signal) {
 		const profile = this.profiles().get(provider);
 		await this.learnCapabilities(provider, signal);
-		if (profile?.discoverModels === true && this.agents.get(provider)?.process.advertisedModels === void 0) await this.advertisedModels(provider, signal).catch((error) => {
-			this.host.logger.warn(`${PLUGIN_ID}: probing ACP agent "${provider}" for model metadata failed`, error);
-		});
+		if (profile?.discoverModels === true) await this.learnModel(provider, profile, model, signal);
 		const process = this.agents.get(provider)?.process;
 		const configured = profile?.models.find((entry) => entry.id === model);
 		const advertised = process?.advertisedModels?.find((entry) => entry.id === model);
-		const efforts = process?.advertisedEfforts;
+		const agentModel = model === "default" ? process?.defaultModel : model;
+		const advertisedWindow = process?.advertisedModels?.find((entry) => entry.id === agentModel)?.contextWindow;
+		const efforts = process?.effortsFor(model);
 		return {
 			provider,
 			id: model,
 			name: configured?.name ?? advertised?.name ?? model,
 			...this.modalities(provider),
-			context: { contextWindow: configured?.contextWindow ?? this.contextWindows.get(provider, model) ?? inferContextWindow(model, configured?.name, configured?.description, advertised?.name, advertised?.description) ?? profile?.contextWindow ?? 2e5 },
+			context: { contextWindow: configured?.contextWindow ?? this.contextWindows.get(provider, model) ?? advertisedWindow ?? inferContextWindow(model, configured?.name, configured?.description, advertised?.name, advertised?.description) ?? profile?.contextWindow ?? 2e5 },
 			...efforts === void 0 ? {} : { reasoning: {
 				efforts: efforts.available.map((level) => ({
 					id: level.id,
@@ -10998,6 +11085,18 @@ var AcpAdapter = class extends LlmAdapter {
 				...efforts.available.some((level) => level.id === efforts.initial) ? { defaultEffort: efforts.initial } : {}
 			} }
 		};
+	}
+	/**
+	* Ask the agent about one model before dsh uses it: the models it advertises (with any
+	* context windows they state) and the thought levels it offers for that model.
+	*/
+	async learnModel(provider, profile, model, signal) {
+		try {
+			if (this.agents.get(provider)?.process.advertisedModels === void 0) await this.advertisedModels(provider, signal);
+			await this.agent(provider, profile).learnEfforts(model, profile.cwd ?? homedir(), signal);
+		} catch (error) {
+			this.host.logger.warn(`${PLUGIN_ID}: probing ACP agent "${provider}" for model metadata failed`, error);
+		}
 	}
 	/**
 	* What the route accepts as input. dsh reads an omitted `inputModalities` as "unknown" and

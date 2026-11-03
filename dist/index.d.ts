@@ -131,6 +131,8 @@ interface AcpAdvertisedModel {
   id: string;
   name: string;
   description?: string;
+  /** The model's context window, when the agent states it ahead of any turn. */
+  contextWindow?: number;
 }
 //#endregion
 //#region src/host/service/context-windows.d.ts
@@ -177,11 +179,16 @@ declare class AcpAdapter extends LlmAdapter {
   /**
    * Exact-model metadata. Capabilities come from the agent itself: accepted input from the
    * `promptCapabilities` of its ACP handshake (learned here, remembered across restarts),
-   * reasoning efforts from its `thought_level` option, and the context window it last
-   * reported through `usage_update`, else one a "1m" token in the model's id, name or
-   * description implies.
+   * reasoning efforts from the `thought_level` option it offers for this very model, and the
+   * context window it last reported through `usage_update`, else the one its model list
+   * states, else one a "1m" token in the model's id, name or description implies.
    */
   resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
+  /**
+   * Ask the agent about one model before dsh uses it: the models it advertises (with any
+   * context windows they state) and the thought levels it offers for that model.
+   */
+  private learnModel;
   /**
    * What the route accepts as input. dsh reads an omitted `inputModalities` as "unknown" and
    * sends images through untouched, while an explicit list without `image` is a negative it
