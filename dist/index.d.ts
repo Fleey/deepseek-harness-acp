@@ -90,6 +90,8 @@ interface AdapterHost {
   logger: HostLogger;
   agentOf: (sessionId: string) => HostAgent | undefined;
   approve: ((request: ApprovalRequest) => Promise<ApprovalOutcome>) | undefined;
+  /** Whether the session runs under dsh's full access: no sandbox and no approval prompts. */
+  fullAccess?: (agent: HostAgent) => boolean;
   /** Request-sized bytes of one image attachment; absent when no attachment store is mounted. */
   readImage: ((ref: unknown, signal?: AbortSignal) => Promise<HostImage>) | undefined;
 }
@@ -209,6 +211,12 @@ declare class AcpAdapter extends LlmAdapter {
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
   private run;
   private finish;
+  /**
+   * A turn the agent reports as cancelled. Agents end a turn that way when a tool call is
+   * refused, and CodeBuddy also reports the turn after such a refusal as cancelled although
+   * it answered in full, so only a cancel this side asked for is an abort.
+   */
+  private cancelled;
   private agent;
   private cwdOf;
   private dropBindings;

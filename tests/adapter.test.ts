@@ -157,6 +157,55 @@ describe('acp adapter', () => {
     expect((await run(denying, request([user('please edit')]))).text).toBe('permission:no')
   })
 
+  it('describes a tool call the agent asks about by id alone', async () => {
+    const asked: Array<{ toolName: string, reason?: string }> = []
+    const adapter = create(profile({ permission: 'ask' }), {
+      ...host(),
+      approve: async ({ toolName, reason }) => {
+        asked.push({ toolName, reason })
+        return 'allowed-once'
+      },
+    })
+    const result = await run(adapter, request([user('run shell')]))
+    expect(result.text).toBe('shell:done')
+    expect(asked).toEqual([{ toolName: `${ROUTE} · execute`, reason: '`echo hi`' }])
+  })
+
+  it('reads per-call usage from usage_update metadata when the prompt response has none', async () => {
+    const result = await run(create(profile({ permission: 'allow' })), request([user('run shell')]))
+    const types = result.chunks.map(chunk => chunk.type)
+    expect(types.indexOf('usage')).toBe(types.length - 2)
+    expect(result.chunks.find(chunk => chunk.type === 'usage')).toEqual({
+      type: 'usage',
+      usage: { inputTokens: 80, outputTokens: 15, totalTokens: 235, cacheReadTokens: 140, reasoningTokens: 3 },
+    })
+  })
+
+  it('allows tool calls without asking under dsh full access', async () => {
+    let asked = 0
+    const adapter = create(profile({ permission: 'ask' }), {
+      ...host(() => {
+        asked += 1
+        return 'rejected'
+      }),
+      fullAccess: () => true,
+    })
+    expect((await run(adapter, request([user('run shell')]))).text).toBe('shell:done')
+    expect(asked).toBe(0)
+  })
+
+  it('explains a turn the agent ends over a refused tool call, and keeps the next answer', async () => {
+    const adapter = create(profile({ permission: 'ask' }), host(() => 'rejected'))
+    const first = user('run shell')
+    const refused = await run(adapter, request([first]))
+    expect(refused.finish).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'PERMISSION_DENIED' } } })
+    expect((refused.finish as any).reason.failure.message).toContain('`echo hi`')
+    expect(refused.chunks.find(chunk => chunk.type === 'usage')).toMatchObject({ usage: { inputTokens: 60, outputTokens: 10 } })
+    const next = await run(adapter, request([first, user('again')]))
+    expect(next.text).toBe('answered after refusal')
+    expect(next.finish).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+  })
+
   it('falls back to read-only when no approval answerer exists', async () => {
     const result = await run(create(profile({ permission: 'ask' }), host(undefined, false)), request([user('please edit')]))
     expect(result.text).toBe('permission:no')

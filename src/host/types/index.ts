@@ -29,6 +29,8 @@ export interface AdapterHost {
   logger: HostLogger
   agentOf: (sessionId: string) => HostAgent | undefined
   approve: ((request: ApprovalRequest) => Promise<ApprovalOutcome>) | undefined
+  /** Whether the session runs under dsh's full access: no sandbox and no approval prompts. */
+  fullAccess?: (agent: HostAgent) => boolean
   /** Request-sized bytes of one image attachment; absent when no attachment store is mounted. */
   readImage: ((ref: unknown, signal?: AbortSignal) => Promise<HostImage>) | undefined
 }

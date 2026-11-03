@@ -76,6 +76,38 @@ async function prompt(params, client) {
     return { stopReason: 'end_turn', usage: { ...session.usage } }
   }
 
+  // CodeBuddy announces a tool call twice, asks about it by id alone, reports usage per model
+  // call in `usage_update._meta` only, and ends a refused turn as cancelled.
+  if (text.includes('shell')) {
+    const meta = { usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_tokens_details: { cached_tokens: 40 }, prompt_cache_hit_tokens: 40, cache_read_input_tokens: 0 } }
+    await update({ sessionUpdate: 'usage_update', used: 100, size: 200000, _meta: meta })
+    await update({ sessionUpdate: 'tool_call', toolCallId: 'sh-1', title: 'Bash', kind: 'other', status: 'in_progress', rawInput: {} })
+    await update({ sessionUpdate: 'tool_call', toolCallId: 'sh-1', title: '`echo hi`', kind: 'execute', status: 'pending', rawInput: { command: 'echo hi' } })
+    const answer = await client.request(acp.methods.client.session.requestPermission, {
+      sessionId: params.sessionId,
+      toolCall: { toolCallId: 'sh-1', rawInput: { command: 'echo hi' } },
+      options: [
+        { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+      ],
+    })
+    if (answer.outcome.outcome !== 'selected' || answer.outcome.optionId !== 'allow') {
+      session.refused = true
+      return { stopReason: 'cancelled' }
+    }
+    await update({ sessionUpdate: 'tool_call_update', toolCallId: 'sh-1', status: 'completed' })
+    await update({ sessionUpdate: 'usage_update', used: 120, size: 200000, _meta: { usage: { prompt_tokens: 120, completion_tokens: 5, total_tokens: 125, prompt_tokens_details: { cached_tokens: 100 }, completion_tokens_details: { reasoning_tokens: 3 } } } })
+    await update({ sessionUpdate: 'usage_update', used: 120, size: 200000 })
+    await update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'shell:done' } })
+    return { stopReason: 'end_turn' }
+  }
+
+  if (session.refused) {
+    session.refused = false
+    await update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answered after refusal' } })
+    return { stopReason: 'cancelled' }
+  }
+
   if (text.includes('silent'))
     return { stopReason: 'end_turn' }
 
