@@ -34,6 +34,11 @@ interface AgentsService {
 
 interface ApprovalService {
   request: (request: ApprovalRequest) => Promise<ApprovalOutcome>
+  effectivePolicy?: (session: HostAgent['session']) => string
+}
+
+interface SandboxPolicyService {
+  resolve: (request: { session: HostAgent['session'] }) => { mode: string }
 }
 
 interface AttachmentsService {
@@ -112,6 +117,19 @@ export function apply(ctx: Context, config: Config): void {
     get approve() {
       const approval = ctx.get('approval') as ApprovalService | undefined
       return approval === undefined ? undefined : (request: ApprovalRequest) => approval.request(request)
+    },
+    // The "full access" preset turns the sandbox off and approvals to "never", where the
+    // approval service rejects every ask; an agent refused that way ends its turn.
+    fullAccess: (agent) => {
+      const sandbox = ctx.get('sandboxPolicy') as SandboxPolicyService | undefined
+      const approval = ctx.get('approval') as ApprovalService | undefined
+      try {
+        return sandbox?.resolve({ session: agent.session }).mode === 'danger-full-access'
+          && approval?.effectivePolicy?.(agent.session) === 'never'
+      }
+      catch {
+        return false
+      }
     },
     get readImage() {
       const attachments = ctx.get('attachments') as AttachmentsService | undefined

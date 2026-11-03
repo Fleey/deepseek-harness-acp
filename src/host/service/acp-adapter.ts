@@ -8,6 +8,7 @@ import type {
   ReasoningEffortId,
   ResolvedRetryPolicy,
   StreamChunk,
+  TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import type { AcpAgentProfile } from '../../shared/types.ts'
 import type { AdapterHost } from '../types/index.ts'
@@ -20,9 +21,9 @@ import { LlmAdapter, LlmError, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import { PLUGIN_ID } from '../../shared/constants.ts'
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL_ID } from '../config/constants.ts'
 import { AcpAgentProcess, applyConfigOptions } from './acp-agent.ts'
-import { ChunkTranslator, usageDelta } from './chunk-translator.ts'
+import { addUsage, ChunkTranslator, metaUsage, usageDelta } from './chunk-translator.ts'
 import { ContextWindows, inferContextWindow } from './context-windows.ts'
-import { decidePermission } from './permission.ts'
+import { decidePermission, noteToolCall } from './permission.ts'
 import { PromptCapabilitiesCache } from './prompt-capabilities.ts'
 import { consumedIds, conversationOf, fullPrompt, incrementalPrompt, systemText } from './transcript.ts'
 
@@ -38,6 +39,15 @@ const TEXT_ONLY: readonly ModelModality[] = ['text']
 
 const TEXT_AND_IMAGE: readonly ModelModality[] = ['text', 'image']
 
+/** What a turn learned beside its stream, for {@link AcpAdapter.finish}. */
+interface TurnFacts {
+  permissions: PermissionTurn
+  /** Usage the agent reported per model call; prompt-response usage wins over it. */
+  usage: TokenUsage | undefined
+  /** Whether this side asked the agent to cancel the turn. */
+  cancelRequested: boolean
+}
+
 type Outcome =
   | { kind: 'response', response: PromptResponse }
   | { kind: 'error', error: unknown }
@@ -47,6 +57,8 @@ type Outcome =
 const NO_RETRY = { mode: 'normal', maxRetries: 0 } as const
 
 const CANCEL_GRACE_MS = 5_000
+
+const DENIED_TITLE_CHARS = 160
 
 function spawnFacts(profile: AcpAgentProfile): string {
   return JSON.stringify([profile.command, profile.args, profile.env, profile.cwd ?? null, profile.authMethod ?? null])
@@ -353,32 +365,43 @@ export class AcpAdapter extends LlmAdapter {
       notify()
     }
 
+    const facts: TurnFacts = { permissions: { dshSessionId, signal, tools: new Map() }, usage: undefined, cancelRequested: false }
+
     let idleTimer: NodeJS.Timeout | undefined
     const armIdle = (): void => {
       if (profile.idleTimeoutMs <= 0)
         return
       clearTimeout(idleTimer)
       idleTimer = setTimeout(() => {
+        facts.cancelRequested = true
         agent.cancel(session)
         settle({ kind: 'timeout' })
       }, profile.idleTimeoutMs)
     }
     let cancelTimer: NodeJS.Timeout | undefined
     const onAbort = (): void => {
+      facts.cancelRequested = true
       agent.cancel(session)
       cancelTimer = setTimeout(() => settle({ kind: 'aborted' }), CANCEL_GRACE_MS)
     }
 
-    this.turns.set(session.sessionId, { dshSessionId, signal })
+    this.turns.set(session.sessionId, facts.permissions)
     signal?.addEventListener('abort', onAbort, { once: true })
     armIdle()
     const model = binding.model
     agent.prompt(session, prompt, (update) => {
       armIdle()
-      if (update.sessionUpdate === 'usage_update' && update.size > 0)
-        this.contextWindows.set(route, model, update.size)
-      else if (update.sessionUpdate === 'config_option_update')
+      noteToolCall(facts.permissions.tools, update)
+      if (update.sessionUpdate === 'usage_update') {
+        if (update.size > 0)
+          this.contextWindows.set(route, model, update.size)
+        const call = metaUsage(update._meta)
+        if (call !== undefined)
+          facts.usage = addUsage(facts.usage, call)
+      }
+      else if (update.sessionUpdate === 'config_option_update') {
         applyConfigOptions(session, update.configOptions)
+      }
       queue.push(...translator.push(update))
       notify()
     }).then(
@@ -397,7 +420,7 @@ export class AcpAdapter extends LlmAdapter {
         })
       }
       yield* translator.close()
-      yield* this.finish(outcome, translator, binding, ephemeral, signal)
+      yield* this.finish(outcome, translator, binding, ephemeral, signal, facts)
     }
     finally {
       clearTimeout(idleTimer)
@@ -411,7 +434,7 @@ export class AcpAdapter extends LlmAdapter {
     }
   }
 
-  private* finish(outcome: Outcome, translator: ChunkTranslator, binding: Binding, ephemeral: boolean, signal: AbortSignal | undefined): Iterable<StreamChunk> {
+  private* finish(outcome: Outcome, translator: ChunkTranslator, binding: Binding, ephemeral: boolean, signal: AbortSignal | undefined, facts: TurnFacts): Iterable<StreamChunk> {
     if (outcome.kind === 'error') {
       if (signal?.aborted) {
         yield { type: 'finish', reason: { kind: 'aborted', failure: failure('ABORTED', 'request aborted') } }
@@ -419,6 +442,13 @@ export class AcpAdapter extends LlmAdapter {
       }
       throw outcome.error
     }
+    let usage = facts.usage
+    if (outcome.kind === 'response' && outcome.response.usage != null) {
+      usage = usageDelta(outcome.response.usage, ephemeral ? undefined : binding.usage)
+      binding.usage = outcome.response.usage
+    }
+    if (usage !== undefined)
+      yield { type: 'usage', usage }
     if (outcome.kind === 'timeout') {
       yield { type: 'finish', reason: { kind: 'error', failure: failure('TIMEOUT', `ACP agent was idle for longer than the configured idleTimeoutMs`) } }
       return
@@ -428,10 +458,6 @@ export class AcpAdapter extends LlmAdapter {
       return
     }
     const { response } = outcome
-    if (response.usage != null) {
-      yield { type: 'usage', usage: usageDelta(response.usage, ephemeral ? undefined : binding.usage) }
-      binding.usage = response.usage
-    }
     switch (response.stopReason) {
       case 'end_turn':
         yield translator.emittedBlocks === 0
@@ -442,7 +468,7 @@ export class AcpAdapter extends LlmAdapter {
         yield { type: 'finish', reason: { kind: 'max-tokens' } }
         return
       case 'cancelled':
-        yield { type: 'finish', reason: { kind: 'aborted', failure: failure('ABORTED', 'ACP agent cancelled the turn') } }
+        yield this.cancelled(translator, facts)
         return
       case 'refusal':
         yield { type: 'finish', reason: { kind: 'error', failure: failure('REFUSAL', 'ACP agent refused the request') } }
@@ -450,6 +476,22 @@ export class AcpAdapter extends LlmAdapter {
       default:
         yield { type: 'finish', reason: { kind: 'error', failure: failure('MAX_TURN_REQUESTS', `ACP agent stopped: ${response.stopReason}`) } }
     }
+  }
+
+  /**
+   * A turn the agent reports as cancelled. Agents end a turn that way when a tool call is
+   * refused, and CodeBuddy also reports the turn after such a refusal as cancelled although
+   * it answered in full, so only a cancel this side asked for is an abort.
+   */
+  private cancelled(translator: ChunkTranslator, facts: TurnFacts): StreamChunk {
+    const denied = facts.permissions.denied
+    if (denied !== undefined) {
+      const title = denied.length > DENIED_TITLE_CHARS ? `${denied.slice(0, DENIED_TITLE_CHARS)}…` : denied
+      return { type: 'finish', reason: { kind: 'error', failure: failure('PERMISSION_DENIED', `ACP agent ended the turn because permission was denied for: ${title}`) } }
+    }
+    if (!facts.cancelRequested && translator.emittedBlocks > 0)
+      return { type: 'finish', reason: { kind: 'stop' } }
+    return { type: 'finish', reason: { kind: 'aborted', failure: failure('ABORTED', 'ACP agent cancelled the turn') } }
   }
 
   private agent(route: string, profile: AcpAgentProfile): AcpAgentProcess {

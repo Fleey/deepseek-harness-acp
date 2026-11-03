@@ -10685,6 +10685,60 @@ function usageDelta(current, previous) {
 	if (reasoning > 0) usage.reasoningTokens = reasoning;
 	return usage;
 }
+function objectOf(value) {
+	return typeof value === "object" && value !== null ? value : void 0;
+}
+function count(source, key) {
+	const value = source?.[key];
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : void 0;
+}
+function largest(...values) {
+	return Math.max(0, ...values.filter((value) => value !== void 0));
+}
+/**
+* Usage of one model call that an agent attaches to a `usage_update` as `_meta.usage`, in the
+* OpenAI shape (`prompt_tokens`, cache hits included) or the Anthropic one (`input_tokens`,
+* cache apart). CodeBuddy reports usage this way only: its prompt responses carry none.
+*/
+function metaUsage(meta) {
+	const usage = objectOf(objectOf(meta)?.usage);
+	const prompt = count(usage, "prompt_tokens");
+	const input = count(usage, "input_tokens");
+	const output = count(usage, "completion_tokens") ?? count(usage, "output_tokens");
+	if (usage === void 0 || prompt === void 0 && input === void 0 || output === void 0) return void 0;
+	const cacheRead = largest(count(objectOf(usage.prompt_tokens_details), "cached_tokens"), count(usage, "prompt_cache_hit_tokens"), count(usage, "cache_read_input_tokens"));
+	const cacheWrite = largest(count(usage, "cache_creation_input_tokens"), count(usage, "prompt_cache_write_tokens"));
+	const reasoning = largest(count(objectOf(usage.completion_tokens_details), "reasoning_tokens"), count(usage, "completion_thinking_tokens"));
+	const total = count(usage, "total_tokens");
+	const result = {
+		inputTokens: prompt === void 0 ? input : Math.max(0, prompt - cacheRead - cacheWrite),
+		outputTokens: output,
+		...total === void 0 ? {} : { totalTokens: total }
+	};
+	if (cacheRead > 0) result.cacheReadTokens = cacheRead;
+	if (cacheWrite > 0) result.cacheWriteTokens = cacheWrite;
+	if (reasoning > 0) result.reasoningTokens = reasoning;
+	return result;
+}
+function sum(left, right) {
+	return left === void 0 && right === void 0 ? void 0 : (left ?? 0) + (right ?? 0);
+}
+/** Usage of a turn that ran several model calls. */
+function addUsage(total, call) {
+	if (total === void 0) return { ...call };
+	const result = {
+		inputTokens: total.inputTokens + call.inputTokens,
+		outputTokens: total.outputTokens + call.outputTokens
+	};
+	if (total.totalTokens !== void 0 && call.totalTokens !== void 0) result.totalTokens = total.totalTokens + call.totalTokens;
+	const cacheRead = sum(total.cacheReadTokens, call.cacheReadTokens);
+	const cacheWrite = sum(total.cacheWriteTokens, call.cacheWriteTokens);
+	const reasoning = sum(total.reasoningTokens, call.reasoningTokens);
+	if (cacheRead !== void 0) result.cacheReadTokens = cacheRead;
+	if (cacheWrite !== void 0) result.cacheWriteTokens = cacheWrite;
+	if (reasoning !== void 0) result.reasoningTokens = reasoning;
+	return result;
+}
 //#endregion
 //#region src/host/service/context-windows.ts
 const ONE_MILLION = 1e6;
@@ -10753,6 +10807,17 @@ const READ_ONLY_KINDS = new Set([
 	"think",
 	"fetch"
 ]);
+/** Remember the latest title and kind an agent states for each tool call of a turn. */
+function noteToolCall(tools, update) {
+	if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return;
+	const known = tools.get(update.toolCallId);
+	const title = update.title ?? known?.title;
+	const kind = update.kind ?? known?.kind;
+	tools.set(update.toolCallId, {
+		...title == null ? {} : { title },
+		...kind == null ? {} : { kind }
+	});
+}
 function pick(options, kinds) {
 	for (const kind of kinds) {
 		const option = options.find((entry) => entry.kind === kind);
@@ -10773,24 +10838,28 @@ function reject(request) {
 		optionId: option.optionId
 	} };
 }
-function readOnly(request) {
-	const kind = request.toolCall.kind ?? "other";
+function readOnly(request, kind) {
 	return READ_ONLY_KINDS.has(kind) ? allow(request) : reject(request);
 }
-async function decidePermission(host, route, policy, turn, request) {
+function granted(request, response) {
+	const outcome = response.outcome;
+	if (outcome.outcome !== "selected") return false;
+	const kind = request.options.find((option) => option.optionId === outcome.optionId)?.kind;
+	return kind === "allow_once" || kind === "allow_always";
+}
+async function decide(host, route, policy, turn, request, kind, title) {
 	switch (policy) {
 		case "allow": return allow(request);
 		case "reject": return reject(request);
-		case "read-only": return readOnly(request);
+		case "read-only": return readOnly(request, kind);
 		case "ask": break;
 	}
 	const agent = turn?.dshSessionId === void 0 ? void 0 : host.agentOf(turn.dshSessionId);
+	if (agent !== void 0 && host.fullAccess?.(agent) === true) return allow(request);
 	if (agent === void 0 || host.approve === void 0) {
 		host.logger.warn(`${PLUGIN_ID}: no approval answerer for ACP agent "${route}"; falling back to read-only permission`);
-		return readOnly(request);
+		return readOnly(request, kind);
 	}
-	const kind = request.toolCall.kind ?? "other";
-	const title = request.toolCall.title ?? kind;
 	try {
 		return await host.approve({
 			agent,
@@ -10802,6 +10871,14 @@ async function decidePermission(host, route, policy, turn, request) {
 		host.logger.warn(`${PLUGIN_ID}: approval for ACP agent "${route}" failed; rejecting`, error);
 		return reject(request);
 	}
+}
+async function decidePermission(host, route, policy, turn, request) {
+	const known = turn?.tools.get(request.toolCall.toolCallId);
+	const kind = request.toolCall.kind ?? known?.kind ?? "other";
+	const title = request.toolCall.title ?? known?.title ?? kind;
+	const response = await decide(host, route, policy, turn, request, kind, title);
+	if (turn !== void 0 && turn.denied === void 0 && !granted(request, response)) turn.denied = title;
+	return response;
 }
 //#endregion
 //#region src/host/service/transcript.ts
@@ -10954,6 +11031,7 @@ const NO_RETRY = {
 	maxRetries: 0
 };
 const CANCEL_GRACE_MS = 5e3;
+const DENIED_TITLE_CHARS = 160;
 function spawnFacts(profile) {
 	return JSON.stringify([
 		profile.command,
@@ -11247,31 +11325,43 @@ var AcpAdapter = class extends LlmAdapter {
 			outcome ??= next;
 			notify();
 		};
+		const facts = {
+			permissions: {
+				dshSessionId,
+				signal,
+				tools: /* @__PURE__ */ new Map()
+			},
+			usage: void 0,
+			cancelRequested: false
+		};
 		let idleTimer;
 		const armIdle = () => {
 			if (profile.idleTimeoutMs <= 0) return;
 			clearTimeout(idleTimer);
 			idleTimer = setTimeout(() => {
+				facts.cancelRequested = true;
 				agent.cancel(session);
 				settle({ kind: "timeout" });
 			}, profile.idleTimeoutMs);
 		};
 		let cancelTimer;
 		const onAbort = () => {
+			facts.cancelRequested = true;
 			agent.cancel(session);
 			cancelTimer = setTimeout(() => settle({ kind: "aborted" }), CANCEL_GRACE_MS);
 		};
-		this.turns.set(session.sessionId, {
-			dshSessionId,
-			signal
-		});
+		this.turns.set(session.sessionId, facts.permissions);
 		signal?.addEventListener("abort", onAbort, { once: true });
 		armIdle();
 		const model = binding.model;
 		agent.prompt(session, prompt, (update) => {
 			armIdle();
-			if (update.sessionUpdate === "usage_update" && update.size > 0) this.contextWindows.set(route, model, update.size);
-			else if (update.sessionUpdate === "config_option_update") applyConfigOptions(session, update.configOptions);
+			noteToolCall(facts.permissions.tools, update);
+			if (update.sessionUpdate === "usage_update") {
+				if (update.size > 0) this.contextWindows.set(route, model, update.size);
+				const call = metaUsage(update._meta);
+				if (call !== void 0) facts.usage = addUsage(facts.usage, call);
+			} else if (update.sessionUpdate === "config_option_update") applyConfigOptions(session, update.configOptions);
 			queue.push(...translator.push(update));
 			notify();
 		}).then((response) => settle({
@@ -11290,7 +11380,7 @@ var AcpAdapter = class extends LlmAdapter {
 				});
 			}
 			yield* translator.close();
-			yield* this.finish(outcome, translator, binding, ephemeral, signal);
+			yield* this.finish(outcome, translator, binding, ephemeral, signal, facts);
 		} finally {
 			clearTimeout(idleTimer);
 			clearTimeout(cancelTimer);
@@ -11300,7 +11390,7 @@ var AcpAdapter = class extends LlmAdapter {
 			if (ephemeral) agent.closeSession(session);
 		}
 	}
-	*finish(outcome, translator, binding, ephemeral, signal) {
+	*finish(outcome, translator, binding, ephemeral, signal, facts) {
 		if (outcome.kind === "error") {
 			if (signal?.aborted) {
 				yield {
@@ -11314,6 +11404,15 @@ var AcpAdapter = class extends LlmAdapter {
 			}
 			throw outcome.error;
 		}
+		let usage = facts.usage;
+		if (outcome.kind === "response" && outcome.response.usage != null) {
+			usage = usageDelta(outcome.response.usage, ephemeral ? void 0 : binding.usage);
+			binding.usage = outcome.response.usage;
+		}
+		if (usage !== void 0) yield {
+			type: "usage",
+			usage
+		};
 		if (outcome.kind === "timeout") {
 			yield {
 				type: "finish",
@@ -11335,13 +11434,6 @@ var AcpAdapter = class extends LlmAdapter {
 			return;
 		}
 		const { response } = outcome;
-		if (response.usage != null) {
-			yield {
-				type: "usage",
-				usage: usageDelta(response.usage, ephemeral ? void 0 : binding.usage)
-			};
-			binding.usage = response.usage;
-		}
 		switch (response.stopReason) {
 			case "end_turn":
 				yield translator.emittedBlocks === 0 ? {
@@ -11362,13 +11454,7 @@ var AcpAdapter = class extends LlmAdapter {
 				};
 				return;
 			case "cancelled":
-				yield {
-					type: "finish",
-					reason: {
-						kind: "aborted",
-						failure: failure("ABORTED", "ACP agent cancelled the turn")
-					}
-				};
+				yield this.cancelled(translator, facts);
 				return;
 			case "refusal":
 				yield {
@@ -11387,6 +11473,32 @@ var AcpAdapter = class extends LlmAdapter {
 				}
 			};
 		}
+	}
+	/**
+	* A turn the agent reports as cancelled. Agents end a turn that way when a tool call is
+	* refused, and CodeBuddy also reports the turn after such a refusal as cancelled although
+	* it answered in full, so only a cancel this side asked for is an abort.
+	*/
+	cancelled(translator, facts) {
+		const denied = facts.permissions.denied;
+		if (denied !== void 0) return {
+			type: "finish",
+			reason: {
+				kind: "error",
+				failure: failure("PERMISSION_DENIED", `ACP agent ended the turn because permission was denied for: ${denied.length > DENIED_TITLE_CHARS ? `${denied.slice(0, DENIED_TITLE_CHARS)}…` : denied}`)
+			}
+		};
+		if (!facts.cancelRequested && translator.emittedBlocks > 0) return {
+			type: "finish",
+			reason: { kind: "stop" }
+		};
+		return {
+			type: "finish",
+			reason: {
+				kind: "aborted",
+				failure: failure("ABORTED", "ACP agent cancelled the turn")
+			}
+		};
 	}
 	agent(route, profile) {
 		const existing = this.agents.get(route);
@@ -11516,6 +11628,15 @@ function apply(ctx, config) {
 		get approve() {
 			const approval = ctx.get("approval");
 			return approval === void 0 ? void 0 : (request) => approval.request(request);
+		},
+		fullAccess: (agent) => {
+			const sandbox = ctx.get("sandboxPolicy");
+			const approval = ctx.get("approval");
+			try {
+				return sandbox?.resolve({ session: agent.session }).mode === "danger-full-access" && approval?.effectivePolicy?.(agent.session) === "never";
+			} catch {
+				return false;
+			}
 		},
 		get readImage() {
 			const attachments = ctx.get("attachments");

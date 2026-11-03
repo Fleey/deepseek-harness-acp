@@ -118,3 +118,76 @@ export function usageDelta(current: Usage, previous: Usage | undefined): TokenUs
     usage.reasoningTokens = reasoning
   return usage
 }
+
+type Counts = Record<string, unknown>
+
+function objectOf(value: unknown): Counts | undefined {
+  return typeof value === 'object' && value !== null ? value as Counts : undefined
+}
+
+function count(source: Counts | undefined, key: string): number | undefined {
+  const value = source?.[key]
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function largest(...values: Array<number | undefined>): number {
+  return Math.max(0, ...values.filter(value => value !== undefined))
+}
+
+/**
+ * Usage of one model call that an agent attaches to a `usage_update` as `_meta.usage`, in the
+ * OpenAI shape (`prompt_tokens`, cache hits included) or the Anthropic one (`input_tokens`,
+ * cache apart). CodeBuddy reports usage this way only: its prompt responses carry none.
+ */
+export function metaUsage(meta: unknown): TokenUsage | undefined {
+  const usage = objectOf(objectOf(meta)?.usage)
+  const prompt = count(usage, 'prompt_tokens')
+  const input = count(usage, 'input_tokens')
+  const output = count(usage, 'completion_tokens') ?? count(usage, 'output_tokens')
+  if (usage === undefined || (prompt === undefined && input === undefined) || output === undefined)
+    return undefined
+  // Gateways spell cache hits several ways at once and zero the spellings they do not use.
+  const cacheRead = largest(count(objectOf(usage.prompt_tokens_details), 'cached_tokens'), count(usage, 'prompt_cache_hit_tokens'), count(usage, 'cache_read_input_tokens'))
+  const cacheWrite = largest(count(usage, 'cache_creation_input_tokens'), count(usage, 'prompt_cache_write_tokens'))
+  const reasoning = largest(count(objectOf(usage.completion_tokens_details), 'reasoning_tokens'), count(usage, 'completion_thinking_tokens'))
+  const total = count(usage, 'total_tokens')
+  const result: TokenUsage = {
+    inputTokens: prompt === undefined ? input! : Math.max(0, prompt - cacheRead - cacheWrite),
+    outputTokens: output,
+    ...total === undefined ? {} : { totalTokens: total },
+  }
+  if (cacheRead > 0)
+    result.cacheReadTokens = cacheRead
+  if (cacheWrite > 0)
+    result.cacheWriteTokens = cacheWrite
+  if (reasoning > 0)
+    result.reasoningTokens = reasoning
+  return result
+}
+
+function sum(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0)
+}
+
+/** Usage of a turn that ran several model calls. */
+export function addUsage(total: TokenUsage | undefined, call: TokenUsage): TokenUsage {
+  if (total === undefined)
+    return { ...call }
+  const result: TokenUsage = {
+    inputTokens: total.inputTokens + call.inputTokens,
+    outputTokens: total.outputTokens + call.outputTokens,
+  }
+  // A total stays exact only while every call stated one.
+  if (total.totalTokens !== undefined && call.totalTokens !== undefined)
+    result.totalTokens = total.totalTokens + call.totalTokens
+  const cacheRead = sum(total.cacheReadTokens, call.cacheReadTokens)
+  const cacheWrite = sum(total.cacheWriteTokens, call.cacheWriteTokens)
+  const reasoning = sum(total.reasoningTokens, call.reasoningTokens)
+  if (cacheRead !== undefined)
+    result.cacheReadTokens = cacheRead
+  if (cacheWrite !== undefined)
+    result.cacheWriteTokens = cacheWrite
+  if (reasoning !== undefined)
+    result.reasoningTokens = reasoning
+  return result
+}
