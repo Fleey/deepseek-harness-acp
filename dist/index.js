@@ -10503,7 +10503,7 @@ var AcpAgentProcess = class {
 					clientCapabilities: {},
 					clientInfo: {
 						name: PLUGIN_ID,
-						version: "0.2.1"
+						version: "0.2.2"
 					}
 				}),
 				exited,
